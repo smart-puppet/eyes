@@ -1,0 +1,21 @@
+[property]
+gpu-id=0
+# Approximate ImageNet norm: y = scale * (x - offset), RGB
+# scale ≈ 1/(255*0.226), offsets = mean*255
+net-scale-factor=0.01735207357279195
+offsets=123.675;116.28;103.53
+model-color-format=0
+onnx-file=../models/midas_small.onnx
+model-engine-file=../models/midas_small_fp16.engine
+batch-size=1
+network-mode=2
+# 100 = other / custom network (tensor output, no bbox parser)
+network-type=100
+gie-unique-id=2
+process-mode=1
+output-tensor-meta=1
+infer-dims=3;256;256
+maintain-aspect-ratio=0
+interval=0
+# Output blob name from model-small.onnx
+output-blob-names=797

@@ -1,0 +1,19 @@
+[property]
+gpu-id=0
+# ImageNet norm for Depth Anything V2
+net-scale-factor=0.01735207357279195
+offsets=123.675;116.28;103.53
+model-color-format=0
+onnx-file=../models/dav2_metric_indoor_small_518.onnx
+model-engine-file=../models/dav2_metric_indoor_small_518_int8.engine
+batch-size=1
+# 1 = INT8
+network-mode=1
+network-type=100
+gie-unique-id=2
+process-mode=1
+output-tensor-meta=1
+infer-dims=3;518;518
+maintain-aspect-ratio=0
+interval=0
+output-blob-names=depth

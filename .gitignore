@@ -1,0 +1,52 @@
+# Eyes — NVIDIA DeepStream / TensorRT camera pipeline (Jetson)
+
+.venv/
+.venv-export/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Env / secrets
+.env
+.env.*
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Built native plugins (rebuild via deepstream/Makefile)
+deepstream/*.so
+*.so
+
+# Built engines, weights, export logs (download/build locally)
+models/*.engine
+models/*.onnx
+models/*.onnx.data
+models/*.pt
+models/*.log
+models/*.calib.cache
+models/*.zip
+models/calib/
+models/yolov8n_release/
+!models/labels.txt
+!models/.gitkeep
+
+# Large / vendored third-party trees and installers
+third_party/*.deb
+third_party/*.tbz2
+third_party/*.partial
+third_party/*.whl
+third_party/*.log
+third_party/DeepStream-Yolo/
+third_party/Depth-Anything-V2/
+third_party/fast_scnn/
