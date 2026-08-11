@@ -1,28 +1,3 @@
-def _detections_to_objects(dets, frame_w: int) -> List[Dict[str, Any]]:
-    """Serialize YOLO detections for MQTT / LLM (plain JSON types)."""
-    objects: List[Dict[str, Any]] = []
-    for det in dets:
-        cx = 0.5 * (det.x1 + det.x2)
-        t = cx / max(frame_w, 1)
-        if t < 0.33:
-            bearing = "left"
-        elif t > 0.66:
-            bearing = "right"
-        else:
-            bearing = "center"
-        dist = det.distance_m
-        objects.append(
-            {
-                "label": det.label,
-                "conf": round(float(det.conf), 2),
-                "dist_m": None
-                if dist is None or not np.isfinite(dist)
-                else round(float(dist), 2),
-                "bearing": bearing,
-            }
-        )
-    objects.sort(key=lambda o: (o["dist_m"] is None, o["dist_m"] or 99.0))
-    return objects[:12]
 #!/usr/bin/env python3
 """Debug web for eyes: MJPEG + on-demand capture + robot drive pad (MQTT).
 
