@@ -198,6 +198,24 @@
       cursor: pointer;
       font-weight: 600;
     }
+    .capture-btn {
+      padding: 0.65rem 1.1rem;
+      border-radius: 0.75rem;
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #fff;
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 0.85rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      touch-action: manipulation;
+    }
+    .capture-btn:disabled {
+      opacity: 0.55;
+      cursor: wait;
+    }
+    .capture-btn:active:not(:disabled) { filter: brightness(0.92); }
     label { font-size: 0.85rem; color: var(--muted); }
     input[type="range"] { flex: 1; min-width: 100px; }
     .val { min-width: 2.5rem; font-variant-numeric: tabular-nums; }
@@ -218,7 +236,7 @@
 </head>
 <body>
   <h1>Eyes + drive</h1>
-  <p class="sub">MJPEG camera · boxes/distance toggle · hold arrows to drive (WASD) · STOP flushes MCU</p>
+  <p class="sub">MJPEG camera · Capture runs YOLO/depth/traverse once · hold arrows to drive (WASD) · STOP flushes MCU</p>
 
   <div class="layout">
     <div class="row">
@@ -231,6 +249,7 @@
         <button type="button" id="btnOverlay">Boxes + distance</button>
         <button type="button" id="btnTraverse">Traversability</button>
       </div>
+      <button type="button" class="capture-btn" id="captureBtn">Capture</button>
     </div>
 
     <div class="main">
@@ -276,6 +295,7 @@
     const btnCamera = document.getElementById("btnCamera");
     const btnOverlay = document.getElementById("btnOverlay");
     const btnTraverse = document.getElementById("btnTraverse");
+    const captureBtn = document.getElementById("captureBtn");
     const speedEl = document.getElementById("speed");
     const ttlEl = document.getElementById("ttl");
     const speedVal = document.getElementById("speedVal");
@@ -285,6 +305,8 @@
     ttlEl.addEventListener("input", () => { ttlVal.textContent = ttlEl.value; });
 
     let activeDir = null;
+    let capturing = false;
+    let currentView = "camera";
     const keyMap = {
       ArrowUp: "forward", w: "forward", W: "forward",
       ArrowDown: "backward", s: "backward", S: "backward",
@@ -304,11 +326,18 @@
       return res.json();
     }
 
+    function syncCaptureBtn() {
+      captureBtn.disabled = capturing || currentView === "camera";
+      captureBtn.textContent = capturing ? "Capturing…" : "Capture";
+    }
+
     async function setView(view) {
+      currentView = view;
       btnCamera.classList.toggle("active", view === "camera");
       btnOverlay.classList.toggle("active", view === "boxes");
       btnTraverse.classList.toggle("active", view === "traverse");
       modeBadge.textContent = view;
+      syncCaptureBtn();
       try {
         await post("/api/view", { view });
       } catch (e) {
@@ -319,6 +348,30 @@
     btnOverlay.addEventListener("click", () => setView("boxes"));
     btnTraverse.addEventListener("click", () => setView("traverse"));
 
+    async function triggerCapture() {
+      if (capturing || currentView === "camera") return;
+      capturing = true;
+      syncCaptureBtn();
+      try {
+        const data = await post("/api/capture");
+        statusEl.textContent = [
+          "capture ok  view: " + (data.view || currentView),
+          "infer: " + (data.infer_ms ?? "—") + " ms  dets: " + (data.dets ?? "—"),
+          "closest: " + (data.closest_m ?? "—") + " m  hint: " + (data.hint || "—"),
+        ].join("\n");
+        await poll();
+      } catch (e) {
+        statusEl.textContent = "Capture error: " + e.message;
+      } finally {
+        capturing = false;
+        syncCaptureBtn();
+      }
+    }
+    captureBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      triggerCapture();
+    });
+    syncCaptureBtn();
     async function hold(dir) {
       if (activeDir === dir) return;
       activeDir = dir;
@@ -390,13 +443,19 @@
         stopAll();
         return;
       }
+      if (ev.key === "c" || ev.key === "C") {
+        if (!ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+          ev.preventDefault();
+          triggerCapture();
+        }
+        return;
+      }
       const dir = keyMap[ev.key];
       if (dir) {
         ev.preventDefault();
         hold(dir);
       }
-    });
-    window.addEventListener("keyup", (ev) => {
+    });    window.addEventListener("keyup", (ev) => {
       const dir = keyMap[ev.key];
       if (dir && activeDir === dir) {
         ev.preventDefault();
@@ -407,10 +466,12 @@
 
     function renderState(data) {
       const view = data.view || (data.overlay ? "boxes" : "camera");
+      currentView = view;
       btnCamera.classList.toggle("active", view === "camera");
       btnOverlay.classList.toggle("active", view === "boxes");
       btnTraverse.classList.toggle("active", view === "traverse");
       modeBadge.textContent = view;
+      syncCaptureBtn();
 
       const drive = data.drive || {};
       const st = drive.status || {};
@@ -433,7 +494,7 @@
 
       const sec = (data.scene && data.scene.sectors) || {};
       const lines = [
-        "view: " + view,
+        "view: " + view + "  mode: manual capture",
         "fps: " + (data.fps ?? "—") + "  infer: " + (data.infer_ms ?? "—") + " ms",
         "dets: " + (data.dets ?? "—") + "  closest: " + (data.closest_m ?? "—") + " m",
         "hint: " + (data.hint || "—"),
@@ -446,7 +507,9 @@
         "mode: " + (st.mode ?? "—") + "  estop: " + (estop ? "YES" : "no"),
         "error: " + (errs.join("; ") || "—"),
       ];
-      statusEl.textContent = lines.join("\n");
+      if (!capturing) {
+        statusEl.textContent = lines.join("\n");
+      }
     }
 
     async function poll() {

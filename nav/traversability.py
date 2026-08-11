@@ -219,9 +219,19 @@ def build_scene(
         else:
             hint = f"center blocked at {_fmt(center)}"
     elif floor_ahead_pct < 0.15:
-        hint = "little floor visible ahead"
+        hint = "little free floor ahead (path may be blocked or unclear)"
     else:
         hint = f"path mostly clear; closest {_fmt(closest_m)}"
+
+    if objects:
+        top = objects[0]
+        lab = str(top.get("label") or "object").replace("_", " ")
+        dist = top.get("dist_m")
+        br = top.get("bearing") or "center"
+        if dist is not None:
+            hint = f"{hint}; nearest object: {lab} at {dist}m ({br})"
+        else:
+            hint = f"{hint}; nearest object: {lab} ({br})"
 
     def _round_sec(v: float) -> Optional[float]:
         return None if not np.isfinite(v) else round(float(v), 2)

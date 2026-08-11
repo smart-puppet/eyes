@@ -1,14 +1,41 @@
+def _detections_to_objects(dets, frame_w: int) -> List[Dict[str, Any]]:
+    """Serialize YOLO detections for MQTT / LLM (plain JSON types)."""
+    objects: List[Dict[str, Any]] = []
+    for det in dets:
+        cx = 0.5 * (det.x1 + det.x2)
+        t = cx / max(frame_w, 1)
+        if t < 0.33:
+            bearing = "left"
+        elif t > 0.66:
+            bearing = "right"
+        else:
+            bearing = "center"
+        dist = det.distance_m
+        objects.append(
+            {
+                "label": det.label,
+                "conf": round(float(det.conf), 2),
+                "dist_m": None
+                if dist is None or not np.isfinite(dist)
+                else round(float(dist), 2),
+                "bearing": bearing,
+            }
+        )
+    objects.sort(key=lambda o: (o["dist_m"] is None, o["dist_m"] or 99.0))
+    return objects[:12]
 #!/usr/bin/env python3
-"""Debug web for eyes: MJPEG + overlay toggle + robot drive pad (MQTT).
+"""Debug web for eyes: MJPEG + on-demand capture + robot drive pad (MQTT).
 
-UI shell mirrors drive/debug_web. Video is OpenCV capture with optional
-YOLO + DA-V2 Metric INT8 overlays. Drive arrows publish to robot/drive/*.
+UI shell mirrors drive/debug_web. Video is OpenCV capture; YOLO / DA-V2 /
+Fast-SCNN run on Capture (HTTP or robot/nav/capture). Drive arrows publish
+to robot/drive/*.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -124,8 +151,35 @@ def _draw_detections(frame: np.ndarray, detections) -> None:
         )
 
 
+def _detections_to_objects(dets, frame_w: int) -> List[Dict[str, Any]]:
+    """Serialize YOLO detections for MQTT / LLM (plain JSON types)."""
+    objects: List[Dict[str, Any]] = []
+    for det in dets:
+        cx = 0.5 * (det.x1 + det.x2)
+        t = cx / max(frame_w, 1)
+        if t < 0.33:
+            bearing = "left"
+        elif t > 0.66:
+            bearing = "right"
+        else:
+            bearing = "center"
+        dist = det.distance_m
+        objects.append(
+            {
+                "label": det.label,
+                "conf": round(float(det.conf), 2),
+                "dist_m": None
+                if dist is None or not np.isfinite(dist)
+                else round(float(dist), 2),
+                "bearing": bearing,
+            }
+        )
+    objects.sort(key=lambda o: (o["dist_m"] is None, o["dist_m"] or 99.0))
+    return objects[:12]
+
+
 class EyesStreamer:
-    """Background capture + optional YOLO/DA-V2/Fast-SCNN → MJPEG JPEGs."""
+    """Background MJPEG + one-shot YOLO/DA-V2/Fast-SCNN on Capture."""
 
     def __init__(
         self,
@@ -159,7 +213,7 @@ class EyesStreamer:
         self.seg_every = max(1, int(seg_every))
 
         self._lock = threading.Lock()
-        # view: camera | boxes | traverse
+        # view: camera | boxes | traverse — selects what Capture computes
         if overlay and view == "camera":
             view = "boxes"
         self._view = view if view in ("camera", "boxes", "traverse") else "camera"
@@ -174,6 +228,12 @@ class EyesStreamer:
         self._error: Optional[str] = None
         self._frame_i = 0
         self._last_scene: Dict[str, Any] = {}
+        self._hold_vis: Optional[np.ndarray] = None
+        self._capturing = False
+        self._capture_pending = threading.Event()
+        self._capture_done = threading.Event()
+        self._capture_error: Optional[str] = None
+        self._pending_req_id: Optional[str] = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -184,6 +244,8 @@ class EyesStreamer:
 
     def stop(self) -> None:
         self._running = False
+        self._capture_pending.set()  # unblock waiters
+        self._capture_done.set()
         if self._thread:
             self._thread.join(timeout=5.0)
             self._thread = None
@@ -196,6 +258,54 @@ class EyesStreamer:
             raise ValueError(f"bad view: {view}")
         with self._lock:
             self._view = view
+            if view == "camera":
+                self._hold_vis = None
+
+    def request_capture(
+        self,
+        timeout: float = 60.0,
+        *,
+        view: Optional[str] = None,
+        req_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run one inference+publish cycle on the next camera frame."""
+        if view is not None:
+            self.set_view(view)
+        with self._lock:
+            if self._view == "camera":
+                return {
+                    "ok": False,
+                    "error": "select Boxes or Traversability before capturing",
+                }
+            if self._capturing or self._capture_pending.is_set():
+                return {"ok": False, "error": "capture already in progress"}
+            self._capture_error = None
+            self._pending_req_id = req_id
+            self._capturing = True
+        self._capture_done.clear()
+        self._capture_pending.set()
+        if not self._capture_done.wait(timeout):
+            with self._lock:
+                self._capturing = False
+                self._pending_req_id = None
+                self._capture_pending.clear()
+            return {"ok": False, "error": "capture timeout"}
+        with self._lock:
+            self._capturing = False
+            err = self._capture_error
+            closest = self._closest_m
+            result = {
+                "ok": err is None,
+                "view": self._view,
+                "infer_ms": round(self._infer_ms, 1),
+                "dets": self._num_dets,
+                "closest_m": None if not np.isfinite(closest) else round(float(closest), 2),
+                "hint": self._hint,
+                "scene": dict(self._last_scene),
+                "req_id": req_id,
+                "error": err,
+            }
+        return result
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -212,6 +322,8 @@ class EyesStreamer:
                 "device": self.device,
                 "frame": self._frame_i,
                 "error": self._error,
+                "capturing": self._capturing or self._capture_pending.is_set(),
+                "manual": True,
                 "yolo": str(self.yolo_path.name),
                 "depth": str(self.depth_path.name),
                 "scnn": str(self.scnn_path.name),
@@ -253,7 +365,6 @@ class EyesStreamer:
         depth_h = 518
         scnn_h, scnn_w = 256, 640
         engines_loaded = False
-        last_floor: Optional[np.ndarray] = None
 
         fps_t0 = time.perf_counter()
         fps_n = 0
@@ -267,133 +378,232 @@ class EyesStreamer:
                     time.sleep(0.01)
                     continue
 
+                do_capture = self._capture_pending.is_set()
+                if do_capture:
+                    self._capture_pending.clear()
+                    # Drop buffered frames so capture uses a fresh image.
+                    for _ in range(3):
+                        if not cap.grab():
+                            break
+                    ok, frame = cap.retrieve()
+                    if not ok or frame is None:
+                        with self._lock:
+                            self._capture_error = "camera frame grab failed"
+                            self._capturing = False
+                        self._capture_done.set()
+                        continue
+
                 with self._lock:
                     view = self._view
+                    hold_vis = self._hold_vis
 
                 closest_m = float("nan")
                 num_dets = 0
                 infer_ms = 0.0
                 hint = ""
                 scene_payload: Dict[str, Any] = {}
+                capture_err: Optional[str] = None
                 vis = frame
-                need_infer = view in ("boxes", "traverse")
 
-                if need_infer:
-                    if not engines_loaded:
-                        try:
-                            yolo = TrtEngine(self.yolo_path)
-                            depth_engine = TrtEngine(self.depth_path)
-                            yolo_w = int(yolo.input_shape[3])
-                            depth_h = int(depth_engine.input_shape[2])
-                            if view == "traverse" or self.scnn_path.is_file():
-                                scnn = TrtEngine(self.scnn_path)
-                                scnn_h = int(scnn.input_shape[2])
-                                scnn_w = int(scnn.input_shape[3])
-                            engines_loaded = True
-                            with self._lock:
-                                self._error = None
-                        except Exception as exc:  # noqa: BLE001
-                            with self._lock:
-                                self._error = f"engine load failed: {exc}"
-                            engines_loaded = False
-                            yolo = depth_engine = scnn = None
+                if do_capture:
+                    if view == "camera":
+                        capture_err = "select Boxes or Traversability before capturing"
+                    else:
+                        if not engines_loaded:
+                            try:
+                                yolo = TrtEngine(self.yolo_path)
+                                depth_engine = TrtEngine(self.depth_path)
+                                yolo_w = int(yolo.input_shape[3])
+                                depth_h = int(depth_engine.input_shape[2])
+                                if view == "traverse" or self.scnn_path.is_file():
+                                    scnn = TrtEngine(self.scnn_path)
+                                    scnn_h = int(scnn.input_shape[2])
+                                    scnn_w = int(scnn.input_shape[3])
+                                engines_loaded = True
+                                with self._lock:
+                                    self._error = None
+                            except Exception as exc:  # noqa: BLE001
+                                capture_err = f"engine load failed: {exc}"
+                                with self._lock:
+                                    self._error = capture_err
+                                engines_loaded = False
+                                yolo = depth_engine = scnn = None
 
-                    if yolo is not None and depth_engine is not None:
-                        t0 = time.perf_counter()
-                        yolo_in, info = preprocess_yolo(frame, size=yolo_w)
-                        yolo_out = yolo.infer(yolo_in)
-                        raw = next(iter(yolo_out.values()))
-                        if raw.ndim >= 2 and int(raw.shape[-1]) == 6:
-                            dets = postprocess_yolo_end2end(
-                                raw, info, conf_thres=self.conf, max_det=30
-                            )
-                        else:
-                            dets = postprocess_yolo(
-                                raw,
-                                info,
-                                conf_thres=self.conf,
-                                iou_thres=self.iou,
-                                max_det=30,
-                            )
-                        depth_in = preprocess_dav2(frame, size=depth_h)
-                        depth_out = depth_engine.infer(depth_in)
-                        depth_map = resize_depth_to_frame(
-                            next(iter(depth_out.values())), frame.shape[:2]
-                        )
-                        attach_metric_distances(dets, depth_map)
-                        closest_m, closest_xy = closest_scene_metric(depth_map)
-                        num_dets = len(dets)
+                        if capture_err is None and yolo is not None and depth_engine is not None:
+                            try:
+                                t0 = time.perf_counter()
+                                yolo_in, info = preprocess_yolo(frame, size=yolo_w)
+                                yolo_out = yolo.infer(yolo_in)
+                                raw = next(iter(yolo_out.values()))
+                                if raw.ndim >= 2 and int(raw.shape[-1]) == 6:
+                                    yolo_branch = "end2end"
+                                    # Top raw score before threshold (helps debug empty scenes).
+                                    pred = raw[0] if raw.ndim == 3 else raw
+                                    raw_scores = pred[:, 4].astype(np.float32, copy=False)
+                                    top_raw = float(np.max(raw_scores)) if raw_scores.size else 0.0
+                                    n_raw = int(np.sum(raw_scores >= self.conf))
+                                    dets = postprocess_yolo_end2end(
+                                        raw, info, conf_thres=self.conf, max_det=30
+                                    )
+                                else:
+                                    yolo_branch = "classic"
+                                    pred = raw[0] if raw.ndim == 3 else raw
+                                    if pred.shape[0] < pred.shape[1]:
+                                        pred = pred.T
+                                    confs = pred[:, 4:].max(axis=1)
+                                    top_raw = float(np.max(confs)) if confs.size else 0.0
+                                    n_raw = int(np.sum(confs >= self.conf))
+                                    dets = postprocess_yolo(
+                                        raw,
+                                        info,
+                                        conf_thres=self.conf,
+                                        iou_thres=self.iou,
+                                        max_det=30,
+                                    )
+                                depth_in = preprocess_dav2(frame, size=depth_h)
+                                depth_out = depth_engine.infer(depth_in)
+                                depth_map = resize_depth_to_frame(
+                                    next(iter(depth_out.values())), frame.shape[:2]
+                                )
+                                attach_metric_distances(dets, depth_map)
+                                closest_m, closest_xy = closest_scene_metric(depth_map)
+                                num_dets = len(dets)
+                                print(
+                                    f"YOLO {yolo_branch} shape={tuple(raw.shape)} "
+                                    f"top={top_raw:.3f} above_conf={n_raw} kept={num_dets} "
+                                    f"conf_thres={self.conf}",
+                                    flush=True,
+                                )
+                                if num_dets:
+                                    print(
+                                        "YOLO kept: "
+                                        + ", ".join(
+                                            f"{d.label}:{d.conf:.2f}" for d in dets[:8]
+                                        ),
+                                        flush=True,
+                                    )
 
-                        if view == "traverse" and scnn is not None:
-                            if self._frame_i % self.seg_every == 0 or last_floor is None:
-                                scnn_in = preprocess_fast_scnn(frame, scnn_h, scnn_w)
-                                scnn_out = next(iter(scnn.infer(scnn_in).values()))
-                                labels = logits_to_labels(scnn_out)
-                                floor, _wall, _other = remap_apartment(labels)
-                                last_floor = resize_mask_to_frame(floor, frame.shape[:2])
-                            floor_mask = (
-                                last_floor
-                                if last_floor is not None
-                                else np.zeros(frame.shape[:2], dtype=bool)
-                            )
-                            scene = build_scene(
-                                depth_m=depth_map,
-                                floor_mask=floor_mask,
-                                detections=dets,
-                                frame_hw=frame.shape[:2],
-                                closest_m=closest_m,
-                            )
-                            hint = scene.payload.get("hint", "")
-                            scene_payload = scene.payload
-                            vis = overlay_traversability(
-                                frame, scene.free_mask, scene.bev, hint
-                            )
-                            _draw_detections(vis, dets)
-                            if self.scene_pub is not None:
-                                self.scene_pub.publish(scene.payload)
-                        else:
-                            vis = frame.copy()
-                            _draw_detections(vis, dets)
-                            if closest_xy is not None and np.isfinite(closest_m):
-                                cv2.circle(vis, closest_xy, 8, (40, 40, 255), 2, cv2.LINE_AA)
-                                cv2.circle(vis, closest_xy, 3, (40, 40, 255), -1, cv2.LINE_AA)
-                            label = (
-                                f"{num_dets} dets  closest={closest_m:.2f}m"
-                                if np.isfinite(closest_m)
-                                else f"{num_dets} dets"
-                            )
-                            cv2.putText(
-                                vis,
-                                label,
-                                (10, 48),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.6,
-                                (40, 220, 255),
-                                2,
-                                cv2.LINE_AA,
-                            )
-                        infer_ms = (time.perf_counter() - t0) * 1000.0
-                else:
+                                if view == "traverse":
+                                    if scnn is None and self.scnn_path.is_file():
+                                        scnn = TrtEngine(self.scnn_path)
+                                        scnn_h = int(scnn.input_shape[2])
+                                        scnn_w = int(scnn.input_shape[3])
+                                    if scnn is None:
+                                        raise RuntimeError("Fast-SCNN engine not loaded")
+                                    scnn_in = preprocess_fast_scnn(frame, scnn_h, scnn_w)
+                                    scnn_out = next(iter(scnn.infer(scnn_in).values()))
+                                    labels = logits_to_labels(scnn_out)
+                                    floor, _wall, _other = remap_apartment(labels)
+                                    floor_mask = resize_mask_to_frame(floor, frame.shape[:2])
+                                    scene = build_scene(
+                                        depth_m=depth_map,
+                                        floor_mask=floor_mask,
+                                        detections=dets,
+                                        frame_hw=frame.shape[:2],
+                                        closest_m=closest_m,
+                                    )
+                                    hint = scene.payload.get("hint", "")
+                                    scene_payload = dict(scene.payload)
+                                    # Always re-attach YOLO objects from the same dets we draw
+                                    # (avoids empty MQTT objects while boxes are visible).
+                                    scene_payload["objects"] = _detections_to_objects(
+                                        dets, frame.shape[1]
+                                    )
+                                    with self._lock:
+                                        pending_id = self._pending_req_id
+                                    if pending_id:
+                                        scene_payload["req_id"] = pending_id
+                                    print(
+                                        f"scene publish objects={len(scene_payload['objects'])} "
+                                        f"hint={hint!r}",
+                                        flush=True,
+                                    )
+                                    vis = overlay_traversability(
+                                        frame, scene.free_mask, scene.bev, hint
+                                    )
+                                    _draw_detections(vis, dets)
+                                    if self.scene_pub is not None:
+                                        self.scene_pub.publish(scene_payload)
+                                else:
+                                    vis = frame.copy()
+                                    _draw_detections(vis, dets)
+                                    if closest_xy is not None and np.isfinite(closest_m):
+                                        cv2.circle(
+                                            vis, closest_xy, 8, (40, 40, 255), 2, cv2.LINE_AA
+                                        )
+                                        cv2.circle(
+                                            vis, closest_xy, 3, (40, 40, 255), -1, cv2.LINE_AA
+                                        )
+                                    label = (
+                                        f"{num_dets} dets  closest={closest_m:.2f}m"
+                                        if np.isfinite(closest_m)
+                                        else f"{num_dets} dets"
+                                    )
+                                    cv2.putText(
+                                        vis,
+                                        label,
+                                        (10, 48),
+                                        cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.6,
+                                        (40, 220, 255),
+                                        2,
+                                        cv2.LINE_AA,
+                                    )
+                                infer_ms = (time.perf_counter() - t0) * 1000.0
+                                hold_vis = vis.copy()
+                            except Exception as exc:  # noqa: BLE001
+                                capture_err = f"capture failed: {exc}"
+                                with self._lock:
+                                    self._error = capture_err
+                        elif capture_err is None:
+                            capture_err = "engines not ready"
+
+                    with self._lock:
+                        self._capture_error = capture_err
+                        self._pending_req_id = None
+                        if hold_vis is not None and capture_err is None:
+                            self._hold_vis = hold_vis
+                        if scene_payload:
+                            self._last_scene = scene_payload
+                        if capture_err is None:
+                            self._infer_ms = float(infer_ms)
+                            self._num_dets = int(num_dets)
+                            self._closest_m = float(closest_m)
+                            self._hint = hint
+                    self._capture_done.set()
+
+                # Idle display: freeze last capture when in boxes/traverse; else live
+                if view == "camera":
                     if engines_loaded:
                         for eng in (yolo, depth_engine, scnn):
                             if eng is not None:
                                 eng.close()
                         yolo = depth_engine = scnn = None
                         engines_loaded = False
-                        last_floor = None
+                    vis = frame
+                    hold_vis = None
+                elif hold_vis is not None and not do_capture:
+                    vis = hold_vis.copy()
+                else:
+                    vis = frame if not do_capture or capture_err else vis
 
                 fps_n += 1
                 now = time.perf_counter()
                 with self._lock:
                     fps = self._fps
+                    last_infer_ms = self._infer_ms
                 if now - fps_t0 >= 1.0:
                     fps = fps_n / (now - fps_t0)
                     fps_n = 0
                     fps_t0 = now
 
+                show_ms = infer_ms if do_capture and capture_err is None else last_infer_ms
+                mode = "CAPTURE" if do_capture and capture_err is None else (
+                    "HOLD" if hold_vis is not None and view != "camera" else "LIVE"
+                )
                 cv2.putText(
                     vis,
-                    f"{fps:.1f} FPS  {view}  {infer_ms:.0f}ms",
+                    f"{fps:.1f} FPS  {view}  {mode}  {show_ms:.0f}ms",
                     (10, 24),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
@@ -407,19 +617,17 @@ class EyesStreamer:
                     if jpeg:
                         self._jpeg = jpeg
                     self._fps = float(fps)
-                    self._infer_ms = float(infer_ms)
-                    self._num_dets = int(num_dets)
-                    self._closest_m = float(closest_m)
-                    self._hint = hint
-                    if scene_payload:
-                        self._last_scene = scene_payload
+                    if do_capture and capture_err is None:
+                        # already updated above
+                        pass
+                    elif view == "camera":
+                        self._hold_vis = None
                     self._frame_i += 1
         finally:
             cap.release()
             for eng in (yolo, depth_engine, scnn):
                 if eng is not None:
                     eng.close()
-
 
 streamer: Optional[EyesStreamer] = None
 scene_publisher: Optional[ScenePublisher] = None
@@ -595,6 +803,7 @@ class HoldRequest(BaseModel):
 @app.on_event("startup")
 def _startup() -> None:
     global streamer, scene_publisher
+    logging.getLogger("uvicorn.access").addFilter(_QuietAccessFilter())
     broker = str(_cfg.get("broker", os.environ.get("MQTT_BROKER", "127.0.0.1")))
     broker_port = int(_cfg.get("broker_port", os.environ.get("MQTT_PORT", "1883")))
     if bridge.client is None and bridge._error is None:
@@ -607,15 +816,37 @@ def _startup() -> None:
         )
         bridge.start()
 
+    def _handle_mqtt_capture(payload: Dict[str, Any]) -> None:
+        if streamer is None:
+            print("capture request ignored: streamer not ready", flush=True)
+            return
+        view = str(payload.get("view") or "traverse")
+        if view not in ("boxes", "traverse"):
+            view = "traverse"
+        req_id = payload.get("req_id")
+        req_id_s = str(req_id) if req_id else None
+        timeout = float(payload.get("timeout_s") or 60.0)
+        print(
+            f"MQTT capture req_id={req_id_s or '—'} view={view}",
+            flush=True,
+        )
+        result = streamer.request_capture(timeout=timeout, view=view, req_id=req_id_s)
+        if not result.get("ok"):
+            print(f"MQTT capture failed: {result.get('error')}", flush=True)
+
     if scene_publisher is None:
         scene_publisher = ScenePublisher(
             broker=broker,
             port=broker_port,
             topic=str(_cfg.get("scene_topic", "robot/nav/scene")),
+            capture_topic=str(_cfg.get("capture_topic", "robot/nav/capture")),
             username=_cfg.get("username") or os.environ.get("MQTT_USERNAME"),
             password=_cfg.get("password") or os.environ.get("MQTT_PASSWORD"),
+            on_capture=_handle_mqtt_capture,
         )
         scene_publisher.start()
+    else:
+        scene_publisher.set_capture_handler(_handle_mqtt_capture)
 
     if streamer is not None:
         return
@@ -633,7 +864,7 @@ def _startup() -> None:
         yolo_path=Path(_cfg.get("yolo", DEFAULT_YOLO)),
         depth_path=Path(_cfg.get("depth", DEFAULT_DEPTH)),
         scnn_path=Path(_cfg.get("scnn", DEFAULT_SCNN)),
-        conf=float(_cfg.get("conf", 0.4)),
+        conf=float(_cfg.get("conf", 0.25)),
         iou=float(_cfg.get("iou", 0.45)),
         jpeg_quality=int(_cfg.get("jpeg_quality", 80)),
         overlay=bool(_cfg.get("overlay", False)),
@@ -686,6 +917,17 @@ def api_view(body: ViewRequest) -> Dict[str, Any]:
         raise HTTPException(503, "streamer not ready")
     streamer.set_view(body.view)
     return {"ok": True, "view": body.view}
+
+
+@app.post("/api/capture")
+def api_capture() -> Dict[str, Any]:
+    """Run one YOLO/depth/(traverse) inference and publish scene if applicable."""
+    if streamer is None:
+        raise HTTPException(503, "streamer not ready")
+    result = streamer.request_capture()
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error") or "capture failed")
+    return result
 
 
 @app.post("/api/hold")
@@ -751,6 +993,16 @@ def stream_mjpg() -> StreamingResponse:
     )
 
 
+class _QuietAccessFilter(logging.Filter):
+    """Drop high-frequency poll/stream access lines from uvicorn."""
+
+    _SKIP = ("/api/state", "/stream.mjpg")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(path in msg for path in self._SKIP)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="eyes debug web (MJPEG + drive pad)")
     p.add_argument("--host", default="0.0.0.0")
@@ -764,7 +1016,7 @@ def main() -> None:
     p.add_argument("--yolo", type=Path, default=DEFAULT_YOLO)
     p.add_argument("--depth", type=Path, default=DEFAULT_DEPTH)
     p.add_argument("--scnn", type=Path, default=DEFAULT_SCNN)
-    p.add_argument("--conf", type=float, default=0.4)
+    p.add_argument("--conf", type=float, default=0.25)
     p.add_argument("--iou", type=float, default=0.45)
     p.add_argument("--jpeg-quality", type=int, default=80)
     p.add_argument(
@@ -780,6 +1032,7 @@ def main() -> None:
     )
     p.add_argument("--seg-every", type=int, default=2, help="Run Fast-SCNN every N frames")
     p.add_argument("--scene-topic", default="robot/nav/scene")
+    p.add_argument("--capture-topic", default="robot/nav/capture")
     p.add_argument("--broker", default=os.environ.get("MQTT_BROKER", "127.0.0.1"))
     p.add_argument(
         "--broker-port",
@@ -824,6 +1077,7 @@ def main() -> None:
             "view": view,
             "seg_every": args.seg_every,
             "scene_topic": args.scene_topic,
+            "capture_topic": args.capture_topic,
             "broker": args.broker,
             "broker_port": args.broker_port,
             "prefix": args.prefix,
@@ -847,7 +1101,8 @@ def main() -> None:
     print(f"Depth  {args.depth}")
     print(f"SCNN   {args.scnn}")
     print(f"View   {view}")
-    print(f"MQTT   {args.broker}:{args.broker_port}  drive={args.prefix}  scene={args.scene_topic}")
+    print(f"MQTT   {args.broker}:{args.broker_port}  drive={args.prefix}")
+    print(f"Scene  {args.scene_topic}  capture={args.capture_topic}")
     _print_access_urls(args.host, args.port)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
