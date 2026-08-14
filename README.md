@@ -7,7 +7,7 @@ Stack overview: [architecture](https://github.com/smart-puppet/docs/blob/main/ar
 Inference is **on demand** (not continuous):
 
 - Debug web **Capture** button, or
-- MQTT `robot/nav/capture` (brain / mcp) → publishes `robot/nav/scene`
+- MQTT `robot/nav/capture` (brain) → publishes `robot/nav/scene`
 
 ## Quick start
 
