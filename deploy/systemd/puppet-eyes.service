@@ -1,0 +1,23 @@
+[Unit]
+Description=Puppet eyes debug web and scene capture
+Documentation=https://github.com/smart-puppet/docs/blob/main/systemd.md
+After=network.target mosquitto.service puppet-drive.service
+Wants=mosquitto.service puppet-drive.service
+PartOf=puppet.target
+
+[Service]
+Type=simple
+User=cvincent
+Group=cvincent
+SupplementaryGroups=video render
+WorkingDirectory=/home/cvincent/Projects/01-Puppet/eyes
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/opt/nvidia/deepstream/deepstream/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/local/cuda/lib64
+ExecStart=/home/cvincent/Projects/01-Puppet/eyes/scripts/run_debug_web.sh
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+
+[Install]
+WantedBy=puppet.target

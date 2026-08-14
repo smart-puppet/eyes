@@ -21,4 +21,6 @@ bash scripts/run_debug_web.sh
 # or: mosquitto_pub -t robot/nav/capture -m '{"req_id":"test","view":"traverse"}'
 ```
 
+Boot service: `deploy/systemd/puppet-eyes.service` — stack install in [systemd](https://github.com/smart-puppet/docs/blob/main/systemd.md) (drive bridge starts first).
+
 Module-local notes: [`docs/`](docs/) (DeepStream, depth, precision).
