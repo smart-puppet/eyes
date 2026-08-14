@@ -14,7 +14,9 @@ WorkingDirectory=/home/cvincent/Projects/01-Puppet/eyes
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/opt/nvidia/deepstream/deepstream/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 Environment=LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/local/cuda/lib64
-ExecStart=/home/cvincent/Projects/01-Puppet/eyes/scripts/run_debug_web.sh
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+ExecStart=/home/cvincent/Projects/01-Puppet/eyes/scripts/run_debug_web.sh --port 80
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20

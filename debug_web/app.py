@@ -142,15 +142,25 @@ def _lan_ipv4s() -> List[str]:
     return found
 
 
+def _http_url(host: str, port: int) -> str:
+    if int(port) == 80:
+        return f"http://{host}"
+    return f"http://{host}:{port}"
+
+
 def _print_access_urls(host: str, port: int) -> None:
-    urls = [f"http://127.0.0.1:{port}", f"http://localhost:{port}"]
+    urls = [_http_url("127.0.0.1", port), _http_url("localhost", port), _http_url("puppet.local", port)]
     if host in ("0.0.0.0", "::", ""):
         for ip in _lan_ipv4s():
-            urls.append(f"http://{ip}:{port}")
+            urls.append(_http_url(ip, port))
     elif host not in ("127.0.0.1", "localhost"):
-        urls.append(f"http://{host}:{port}")
+        urls.append(_http_url(host, port))
+    seen: set[str] = set()
     logger.info("Eyes debug web listening — open:")
     for u in urls:
+        if u in seen:
+            continue
+        seen.add(u)
         logger.info("  %s", u)
 
 

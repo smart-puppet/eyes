@@ -15,6 +15,7 @@ Inference is **on demand** (not continuous):
 # Preview + capture API / MQTT listener
 bash scripts/run_debug_web.sh
 # open http://127.0.0.1:8091 — pick Traversability, press Capture
+# systemd (port 80 + mDNS): http://puppet.local  — see docs systemd.md
 # Language DE/EN/FR is saved to brain/config/language.active (applies on next brain start)
 # Clear logs empties the brain/drive panes
 # Brain and drive log panes appear once those processes publish robot/log/*

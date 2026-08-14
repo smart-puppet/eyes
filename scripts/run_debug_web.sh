@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Eyes debug web: MJPEG camera / boxes+distance toggle (port 8091).
+# Eyes debug web: MJPEG camera / capture UI (port 8091 by default; systemd uses 80).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT/debug_web"
