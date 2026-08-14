@@ -63,6 +63,49 @@ HB_PERIOD_S = 0.15
 LOG_MAX_BRAIN = 5000
 LOG_MAX_DRIVE = 500
 LOG_TOPIC = "robot/log/+"
+LANGUAGE_CODES = ("en", "fr", "de")
+DEFAULT_LANGUAGE = "de"
+DEFAULT_BRAIN_CONFIG = Path(__file__).resolve().parents[2] / "brain" / "config"
+
+
+def _brain_config_dir() -> Path:
+  raw = _cfg.get("brain_config") or os.environ.get("PUPPET_CONFIG_DIR")
+  if raw:
+    return Path(raw)
+  return DEFAULT_BRAIN_CONFIG
+
+
+def _parse_language_code(text: str) -> Optional[str]:
+  first = (text or "").strip().splitlines()
+  if not first:
+    return None
+  code = first[0].strip().lower().strip("'\"")
+  return code if code in LANGUAGE_CODES else None
+
+
+def _read_saved_language(config_dir: Path) -> tuple[str, bool]:
+  path = config_dir / "language.active"
+  if not path.is_file():
+    return DEFAULT_LANGUAGE, False
+  try:
+    parsed = _parse_language_code(path.read_text(encoding="utf-8"))
+  except OSError:
+    return DEFAULT_LANGUAGE, False
+  if parsed is None:
+    return DEFAULT_LANGUAGE, True
+  return parsed, True
+
+
+def _write_saved_language(config_dir: Path, language: str) -> Path:
+  code = str(language or "").strip().lower()
+  if code not in LANGUAGE_CODES:
+    raise ValueError("language must be en, fr, or de")
+  config_dir.mkdir(parents=True, exist_ok=True)
+  path = config_dir / "language.active"
+  tmp = path.with_name("language.active.tmp")
+  tmp.write_text(code + "\n", encoding="utf-8")
+  tmp.replace(path)
+  return path
 
 
 def _lan_ipv4s() -> List[str]:
@@ -721,6 +764,13 @@ class DriveBridge:
             seq = self._log_seq
         return {"ok": True, "seq": seq, "brain": brain, "drive": drive}
 
+    def clear_logs(self) -> Dict[str, Any]:
+        with self._log_lock:
+            self._logs["brain"].clear()
+            self._logs["drive"].clear()
+            self._log_seq = 0
+        return {"ok": True, "seq": 0}
+
     def _on_message(self, client, userdata, msg):
         topic = msg.topic or ""
         try:
@@ -868,6 +918,10 @@ class HoldRequest(BaseModel):
     ttl_ms: int = Field(300, ge=50, le=1000)
 
 
+class LanguageRequest(BaseModel):
+    language: str = Field(..., pattern="^(en|fr|de)$")
+
+
 @app.on_event("startup")
 def _startup() -> None:
     global streamer, scene_publisher
@@ -971,6 +1025,44 @@ def api_state() -> Dict[str, Any]:
 def api_logs(after: int = 0) -> Dict[str, Any]:
     """Tail brain/drive MQTT log lines for the debug UI."""
     return bridge.logs_snapshot(after=max(0, int(after)))
+
+
+@app.post("/api/logs/clear")
+def api_logs_clear() -> Dict[str, Any]:
+    return bridge.clear_logs()
+
+
+@app.get("/api/language")
+def api_language() -> Dict[str, Any]:
+    config_dir = _brain_config_dir()
+    language, exists = _read_saved_language(config_dir)
+    return {
+        "ok": True,
+        "language": language,
+        "exists": exists,
+        "file": str(config_dir / "language.active"),
+        "applies": "brain_start",
+        "note": "Takes effect the next time brain starts",
+    }
+
+
+@app.post("/api/language")
+def api_set_language(body: LanguageRequest) -> Dict[str, Any]:
+    try:
+        path = _write_saved_language(_brain_config_dir(), body.language)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(500, f"could not write language file: {exc}") from exc
+    logger.info("Saved brain language %s → %s (applies on brain start)", body.language, path)
+    return {
+        "ok": True,
+        "language": body.language,
+        "exists": True,
+        "file": str(path),
+        "applies": "brain_start",
+        "note": "Takes effect the next time brain starts",
+    }
 
 
 @app.post("/api/overlay")
@@ -1115,6 +1207,11 @@ def main() -> None:
     )
     p.add_argument("--username", default=os.environ.get("MQTT_USERNAME"))
     p.add_argument("--password", default=os.environ.get("MQTT_PASSWORD"))
+    p.add_argument(
+        "--brain-config",
+        default=os.environ.get("PUPPET_CONFIG_DIR", str(DEFAULT_BRAIN_CONFIG)),
+        help="Brain config dir for language.active (default: sibling brain/config)",
+    )
     args = p.parse_args()
 
     logging.basicConfig(level=logging.DEBUG, format=LOG_FORMAT)
@@ -1161,6 +1258,7 @@ def main() -> None:
             "prefix": args.prefix,
             "username": args.username,
             "password": args.password,
+            "brain_config": args.brain_config,
         }
     )
 
@@ -1181,6 +1279,7 @@ def main() -> None:
     logger.info("View   %s", view)
     logger.info("MQTT   %s:%s  drive=%s", args.broker, args.broker_port, args.prefix)
     logger.info("Scene  %s  capture=%s", args.scene_topic, args.capture_topic)
+    logger.info("Lang   %s (language.active)", args.brain_config)
     _print_access_urls(args.host, args.port)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

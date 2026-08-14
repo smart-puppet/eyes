@@ -272,6 +272,27 @@
       text-transform: uppercase;
       color: var(--accent);
       z-index: 1;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+    }
+    .log-clear {
+      font: inherit;
+      font-size: 0.68rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      padding: 0.2rem 0.55rem;
+      border-radius: 0.4rem;
+      border: 1px solid var(--border);
+      background: var(--btn);
+      color: var(--ink);
+      cursor: pointer;
+    }
+    .log-clear:active { background: var(--btn-active); color: #fff; }
+    .lang-note {
+      font-size: 0.75rem;
+      color: var(--muted);
     }
     .log-line { color: var(--muted); word-break: break-word; }
     .log-line .t { color: #6d7f72; margin-right: 0.4rem; }
@@ -284,7 +305,7 @@
 </head>
 <body>
   <h1>Eyes + drive</h1>
-  <p class="sub">MJPEG camera · Capture runs YOLO/depth/traverse once · hold arrows to drive (WASD) · STOP flushes MCU · live brain/drive logs below</p>
+  <p class="sub">MJPEG camera · Capture runs YOLO/depth/traverse once · hold arrows to drive (WASD) · STOP flushes MCU · language is saved for the next brain start · live brain/drive logs below</p>
 
   <div class="layout">
     <div class="row">
@@ -298,6 +319,12 @@
         <button type="button" id="btnTraverse">Traversability</button>
       </div>
       <button type="button" class="capture-btn" id="captureBtn">Capture</button>
+      <div class="toggle" role="group" aria-label="Brain language">
+        <button type="button" id="langDe">DE</button>
+        <button type="button" id="langEn">EN</button>
+        <button type="button" id="langFr">FR</button>
+      </div>
+      <span class="lang-note" id="langNote">Language applies when brain starts</span>
     </div>
 
     <div class="main">
@@ -335,7 +362,7 @@
       <div class="status" id="status">Connecting…</div>
       <div class="log-pane log-drive" id="driveLog"><h2>Drive logs</h2><div class="log-empty">Waiting for robot/log/drive…</div></div>
     </div>
-    <div class="log-pane log-brain" id="brainLog"><h2>Brain logs</h2><div class="log-empty">Waiting for robot/log/brain…</div></div>
+    <div class="log-pane log-brain" id="brainLog"><h2>Brain logs <button type="button" class="log-clear" id="clearLogsBtn">Clear logs</button></h2><div class="log-empty">Waiting for robot/log/brain…</div></div>
   </div>
 
   <script>
@@ -348,6 +375,10 @@
     const btnOverlay = document.getElementById("btnOverlay");
     const btnTraverse = document.getElementById("btnTraverse");
     const captureBtn = document.getElementById("captureBtn");
+    const langDe = document.getElementById("langDe");
+    const langEn = document.getElementById("langEn");
+    const langFr = document.getElementById("langFr");
+    const langNote = document.getElementById("langNote");
     const speedEl = document.getElementById("speed");
     const ttlEl = document.getElementById("ttl");
     const speedVal = document.getElementById("speedVal");
@@ -424,6 +455,40 @@
       triggerCapture();
     });
     syncCaptureBtn();
+
+    function syncLanguage(code) {
+      langDe.classList.toggle("active", code === "de");
+      langEn.classList.toggle("active", code === "en");
+      langFr.classList.toggle("active", code === "fr");
+    }
+
+    async function loadLanguage() {
+      try {
+        const res = await fetch("/api/language");
+        const data = await res.json();
+        syncLanguage(data.language || "de");
+        langNote.textContent = data.exists
+          ? "Saved " + String(data.language).toUpperCase() + " — restart brain to apply"
+          : "No file yet — brain starts in German until you pick one";
+      } catch (e) {
+        langNote.textContent = "Language: " + e.message;
+      }
+    }
+
+    async function setLanguage(code) {
+      syncLanguage(code);
+      try {
+        await post("/api/language", { language: code });
+        langNote.textContent = "Saved " + code.toUpperCase() + " — restart brain to apply";
+      } catch (e) {
+        langNote.textContent = "Language error: " + e.message;
+        await loadLanguage();
+      }
+    }
+    langDe.addEventListener("click", () => setLanguage("de"));
+    langEn.addEventListener("click", () => setLanguage("en"));
+    langFr.addEventListener("click", () => setLanguage("fr"));
+    loadLanguage();
     async function hold(dir) {
       if (activeDir === dir) return;
       activeDir = dir;
@@ -631,6 +696,27 @@
         if (typeof data.seq === "number") logAfter = data.seq;
       } catch (_) { /* keep last pane */ }
     }
+    function resetLogPane(el, waiting) {
+      el.querySelectorAll(".log-line").forEach((n) => n.remove());
+      if (!el.querySelector(".log-empty")) {
+        const empty = document.createElement("div");
+        empty.className = "log-empty";
+        empty.textContent = waiting;
+        el.appendChild(empty);
+      }
+    }
+
+    document.getElementById("clearLogsBtn").addEventListener("click", async (e) => {
+      e.preventDefault();
+      try {
+        await post("/api/logs/clear");
+        logAfter = 0;
+        resetLogPane(brainLogEl, "Waiting for robot/log/brain…");
+        resetLogPane(driveLogEl, "Waiting for robot/log/drive…");
+      } catch (err) {
+        statusEl.textContent = "Clear logs error: " + err.message;
+      }
+    });
     pollLogs();
     setInterval(pollLogs, 400);
   </script>
