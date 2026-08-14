@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from typing import Any, Callable, Dict, Optional
@@ -10,6 +11,8 @@ from typing import Any, Callable, Dict, Optional
 import paho.mqtt.client as mqtt
 
 CaptureHandler = Callable[[Dict[str, Any]], None]
+
+logger = logging.getLogger("eyes.mqtt")
 
 
 class ScenePublisher:
@@ -60,7 +63,7 @@ class ScenePublisher:
             self._error = f"mqtt connect failed: {exc}"
             self._ok = False
             self._client = None
-            print(self._error, flush=True)
+            logger.warning("%s", self._error)
 
     def stop(self) -> None:
         if self._client:
@@ -70,14 +73,19 @@ class ScenePublisher:
         self._ok = False
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        rc = getattr(reason_code, "value", reason_code)
+        logger.info("MQTT connected rc=%s; subscribe %s", rc, self.capture_topic)
         if self.capture_topic:
             client.subscribe(self.capture_topic, qos=1)
 
     def _on_message(self, client, userdata, msg):
         if msg.topic != self.capture_topic or self._on_capture is None:
             return
+        raw = msg.payload.decode("utf-8", errors="replace") if msg.payload else "{}"
+        preview = raw if len(raw) <= 240 else raw[:237] + "..."
+        logger.info("MQTT recv %s %s", msg.topic, preview)
         try:
-            payload = json.loads(msg.payload.decode("utf-8") or "{}")
+            payload = json.loads(raw or "{}")
         except Exception:
             payload = {}
         if not isinstance(payload, dict):
@@ -97,7 +105,7 @@ class ScenePublisher:
         try:
             handler(payload)
         except Exception as exc:  # noqa: BLE001
-            print(f"capture request failed: {exc}", flush=True)
+            logger.exception("capture request failed: %s", exc)
 
     def publish(self, payload: Dict[str, Any]) -> bool:
         with self._lock:

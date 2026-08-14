@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from collections import deque
 from typing import Any, Dict, Generator, List, Optional
 
 import cv2
@@ -51,11 +52,17 @@ from trt import (  # noqa: E402
     resize_depth_to_frame,
 )
 
+logger = logging.getLogger("eyes")
+
+LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_YOLO = ROOT / "models" / "yolo26n_fp16.engine"
 DEFAULT_DEPTH = ROOT / "models" / "dav2_metric_indoor_small_518_int8.engine"
 DEFAULT_SCNN = ROOT / "models" / "fast_scnn_256x640_fp16.engine"
 HB_PERIOD_S = 0.15
+LOG_MAX_BRAIN = 5000
+LOG_MAX_DRIVE = 500
+LOG_TOPIC = "robot/log/+"
 
 
 def _lan_ipv4s() -> List[str]:
@@ -99,9 +106,9 @@ def _print_access_urls(host: str, port: int) -> None:
             urls.append(f"http://{ip}:{port}")
     elif host not in ("127.0.0.1", "localhost"):
         urls.append(f"http://{host}:{port}")
-    print("Eyes debug web listening — open:")
+    logger.info("Eyes debug web listening — open:")
     for u in urls:
-        print(f"  {u}")
+        logger.info("  %s", u)
 
 
 def _draw_detections(frame: np.ndarray, detections) -> None:
@@ -443,19 +450,21 @@ class EyesStreamer:
                                 attach_metric_distances(dets, depth_map)
                                 closest_m, closest_xy = closest_scene_metric(depth_map)
                                 num_dets = len(dets)
-                                print(
-                                    f"YOLO {yolo_branch} shape={tuple(raw.shape)} "
-                                    f"top={top_raw:.3f} above_conf={n_raw} kept={num_dets} "
-                                    f"conf_thres={self.conf}",
-                                    flush=True,
+                                logger.debug(
+                                    "YOLO %s shape=%s top=%.3f above_conf=%s kept=%s conf_thres=%s",
+                                    yolo_branch,
+                                    tuple(raw.shape),
+                                    top_raw,
+                                    n_raw,
+                                    num_dets,
+                                    self.conf,
                                 )
                                 if num_dets:
-                                    print(
-                                        "YOLO kept: "
-                                        + ", ".join(
+                                    logger.debug(
+                                        "YOLO kept: %s",
+                                        ", ".join(
                                             f"{d.label}:{d.conf:.2f}" for d in dets[:8]
                                         ),
-                                        flush=True,
                                     )
 
                                 if view == "traverse":
@@ -488,10 +497,10 @@ class EyesStreamer:
                                         pending_id = self._pending_req_id
                                     if pending_id:
                                         scene_payload["req_id"] = pending_id
-                                    print(
-                                        f"scene publish objects={len(scene_payload['objects'])} "
-                                        f"hint={hint!r}",
-                                        flush=True,
+                                    logger.info(
+                                        "scene publish objects=%s hint=%r",
+                                        len(scene_payload["objects"]),
+                                        hint,
                                     )
                                     vis = overlay_traversability(
                                         frame, scene.free_mask, scene.bev, hint
@@ -627,6 +636,12 @@ class DriveBridge:
         self._hb_thread: Optional[threading.Thread] = None
         self._running = False
         self._error: Optional[str] = None
+        self._logs: Dict[str, deque] = {
+            "brain": deque(maxlen=LOG_MAX_BRAIN),
+            "drive": deque(maxlen=LOG_MAX_DRIVE),
+        }
+        self._log_seq = 0
+        self._log_lock = threading.Lock()
 
     def configure(
         self,
@@ -657,7 +672,7 @@ class DriveBridge:
             self._error = None
         except Exception as exc:  # noqa: BLE001
             self._error = f"mqtt connect failed: {exc}"
-            print(self._error, flush=True)
+            logger.warning("%s", self._error)
             self.client = None
             return
         self._running = True
@@ -676,22 +691,100 @@ class DriveBridge:
         return f"{self.prefix}/{name}"
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        rc = getattr(reason_code, "value", reason_code)
+        logger.info("MQTT connected rc=%s; drive pad %s", rc, self.prefix)
         client.subscribe(self._topic("status"))
+        client.subscribe(self._topic("cmd"))
+        client.subscribe(LOG_TOPIC)
+
+    def _append_log(self, source: str, *, level: str, logger_name: str, msg: str, ts: float) -> None:
+        source = str(source or "drive").lower()
+        if source not in self._logs:
+            source = "drive"
+        with self._log_lock:
+            self._log_seq += 1
+            self._logs[source].append(
+                {
+                    "seq": self._log_seq,
+                    "source": source,
+                    "ts": ts,
+                    "level": level,
+                    "logger": logger_name,
+                    "msg": msg[:800],
+                }
+            )
+
+    def logs_snapshot(self, after: int = 0) -> Dict[str, Any]:
+        with self._log_lock:
+            brain = [row for row in self._logs["brain"] if row["seq"] > after]
+            drive = [row for row in self._logs["drive"] if row["seq"] > after]
+            seq = self._log_seq
+        return {"ok": True, "seq": seq, "brain": brain, "drive": drive}
 
     def _on_message(self, client, userdata, msg):
+        topic = msg.topic or ""
         try:
-            self.last_status = json.loads(msg.payload.decode("utf-8"))
+            payload = msg.payload.decode("utf-8")
         except Exception:
-            pass
+            return
+        if topic.endswith("/status"):
+            try:
+                self.last_status = json.loads(payload)
+            except Exception:
+                logger.debug("MQTT status decode failed topic=%s", topic)
+            return
+        if topic.endswith("/cmd"):
+            try:
+                data = json.loads(payload) if payload.strip() else {}
+            except json.JSONDecodeError:
+                data = {}
+            cmd = str((data or {}).get("cmd") or "").lower()
+            if cmd in ("hb", "heartbeat"):
+                return
+            self._append_log(
+                "drive",
+                level="INFO",
+                logger_name="mqtt",
+                msg=f"cmd {payload.strip() or '{}'}",
+                ts=time.time(),
+            )
+            return
+        if topic.startswith("robot/log/"):
+            source = topic.rsplit("/", 1)[-1]
+            try:
+                body = json.loads(payload)
+            except json.JSONDecodeError:
+                self._append_log(
+                    source if source in self._logs else "drive",
+                    level="INFO",
+                    logger_name=topic,
+                    msg=payload[:800],
+                    ts=time.time(),
+                )
+                return
+            self._append_log(
+                str(body.get("source") or source),
+                level=str(body.get("level") or "INFO"),
+                logger_name=str(body.get("logger") or topic),
+                msg=str(body.get("msg") or payload),
+                ts=float(body.get("ts") or time.time()),
+            )
 
     def _publish_cmd(self, payload: Dict[str, Any]) -> None:
         if not self.client:
             raise RuntimeError(self._error or "mqtt not connected")
+        cmd = str(payload.get("cmd") or "").lower()
+        line = f"MQTT send {self._topic('cmd')} {json.dumps(payload, separators=(',', ':'))}"
+        if cmd in ("hb", "heartbeat"):
+            logger.debug(line)
+        else:
+            logger.info(line)
         self.client.publish(self._topic("cmd"), json.dumps(payload), qos=1)
 
     def _publish_stop(self) -> None:
         if not self.client:
             raise RuntimeError(self._error or "mqtt not connected")
+        logger.info("MQTT send %s {}", self._topic("stop"))
         self.client.publish(self._topic("stop"), "{}", qos=1)
 
     def _hb_loop(self) -> None:
@@ -793,7 +886,7 @@ def _startup() -> None:
 
     def _handle_mqtt_capture(payload: Dict[str, Any]) -> None:
         if streamer is None:
-            print("capture request ignored: streamer not ready", flush=True)
+            logger.warning("capture request ignored: streamer not ready")
             return
         view = str(payload.get("view") or "traverse")
         if view not in ("boxes", "traverse"):
@@ -801,13 +894,9 @@ def _startup() -> None:
         req_id = payload.get("req_id")
         req_id_s = str(req_id) if req_id else None
         timeout = float(payload.get("timeout_s") or 60.0)
-        print(
-            f"MQTT capture req_id={req_id_s or '—'} view={view}",
-            flush=True,
-        )
         result = streamer.request_capture(timeout=timeout, view=view, req_id=req_id_s)
         if not result.get("ok"):
-            print(f"MQTT capture failed: {result.get('error')}", flush=True)
+            logger.warning("MQTT capture failed: %s", result.get("error"))
 
     if scene_publisher is None:
         scene_publisher = ScenePublisher(
@@ -876,6 +965,12 @@ def api_state() -> Dict[str, Any]:
     eyes = streamer.snapshot() if streamer is not None else {"error": "streamer not ready"}
     drive = bridge.snapshot()
     return {**eyes, "drive": drive}
+
+
+@app.get("/api/logs")
+def api_logs(after: int = 0) -> Dict[str, Any]:
+    """Tail brain/drive MQTT log lines for the debug UI."""
+    return bridge.logs_snapshot(after=max(0, int(after)))
 
 
 @app.post("/api/overlay")
@@ -971,7 +1066,7 @@ def stream_mjpg() -> StreamingResponse:
 class _QuietAccessFilter(logging.Filter):
     """Drop high-frequency poll/stream access lines from uvicorn."""
 
-    _SKIP = ("/api/state", "/stream.mjpg")
+    _SKIP = ("/api/state", "/api/logs", "/stream.mjpg")
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
@@ -1022,6 +1117,14 @@ def main() -> None:
     p.add_argument("--password", default=os.environ.get("MQTT_PASSWORD"))
     args = p.parse_args()
 
+    logging.basicConfig(level=logging.DEBUG, format=LOG_FORMAT)
+    logging.getLogger("paho").setLevel(logging.WARNING)
+    logging.getLogger("paho.mqtt").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").addFilter(_QuietAccessFilter())
+    logging.getLogger("uvicorn").setLevel(logging.INFO)
+    logging.getLogger("uvicorn.error").setLevel(logging.INFO)
+    logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+
     for path in (args.yolo, args.depth, args.scnn):
         if not path.is_file():
             raise SystemExit(f"missing engine: {path}")
@@ -1071,13 +1174,13 @@ def main() -> None:
 
     import uvicorn
 
-    print(f"Camera {device}")
-    print(f"YOLO   {args.yolo}")
-    print(f"Depth  {args.depth}")
-    print(f"SCNN   {args.scnn}")
-    print(f"View   {view}")
-    print(f"MQTT   {args.broker}:{args.broker_port}  drive={args.prefix}")
-    print(f"Scene  {args.scene_topic}  capture={args.capture_topic}")
+    logger.info("Camera %s", device)
+    logger.info("YOLO   %s", args.yolo)
+    logger.info("Depth  %s", args.depth)
+    logger.info("SCNN   %s", args.scnn)
+    logger.info("View   %s", view)
+    logger.info("MQTT   %s:%s  drive=%s", args.broker, args.broker_port, args.prefix)
+    logger.info("Scene  %s  capture=%s", args.scene_topic, args.capture_topic)
     _print_access_urls(args.host, args.port)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

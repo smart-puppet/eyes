@@ -51,7 +51,7 @@
     .layout {
       display: grid;
       gap: 1rem;
-      width: min(1100px, 100%);
+      width: min(1400px, 100%);
     }
     .main {
       display: grid;
@@ -232,11 +232,59 @@
       white-space: pre-wrap;
       word-break: break-word;
     }
+    .info-row {
+      display: grid;
+      gap: 0.75rem;
+      grid-template-columns: 1fr;
+      align-items: stretch;
+    }
+    @media (min-width: 900px) {
+      .info-row { grid-template-columns: 1fr 1fr; }
+    }
+    .log-pane {
+      background: #141a16;
+      border: 1px solid var(--border);
+      border-radius: 0.75rem;
+      overflow: auto;
+      padding: 0.55rem 0.7rem 0.7rem;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: 0.72rem;
+      line-height: 1.4;
+    }
+    .log-drive {
+      min-height: 8rem;
+      max-height: 16rem;
+    }
+    .log-brain {
+      min-height: 28rem;
+      height: 55vh;
+      max-height: 70vh;
+      width: 100%;
+    }
+    .log-pane h2 {
+      position: sticky;
+      top: 0;
+      margin: 0 0 0.45rem;
+      padding: 0.15rem 0 0.35rem;
+      background: #141a16;
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--accent);
+      z-index: 1;
+    }
+    .log-line { color: var(--muted); word-break: break-word; }
+    .log-line .t { color: #6d7f72; margin-right: 0.4rem; }
+    .log-line.debug { color: #7a8c80; }
+    .log-line.info { color: var(--ink); }
+    .log-line.warning { color: var(--warn); }
+    .log-line.error, .log-line.critical { color: #ff8a7a; }
+    .log-empty { color: var(--muted); font-style: italic; }
   </style>
 </head>
 <body>
   <h1>Eyes + drive</h1>
-  <p class="sub">MJPEG camera · Capture runs YOLO/depth/traverse once · hold arrows to drive (WASD) · STOP flushes MCU</p>
+  <p class="sub">MJPEG camera · Capture runs YOLO/depth/traverse once · hold arrows to drive (WASD) · STOP flushes MCU · live brain/drive logs below</p>
 
   <div class="layout">
     <div class="row">
@@ -283,7 +331,11 @@
       </div>
     </div>
 
-    <div class="status" id="status">Connecting…</div>
+    <div class="info-row">
+      <div class="status" id="status">Connecting…</div>
+      <div class="log-pane log-drive" id="driveLog"><h2>Drive logs</h2><div class="log-empty">Waiting for robot/log/drive…</div></div>
+    </div>
+    <div class="log-pane log-brain" id="brainLog"><h2>Brain logs</h2><div class="log-empty">Waiting for robot/log/brain…</div></div>
   </div>
 
   <script>
@@ -522,6 +574,65 @@
     }
     poll();
     setInterval(poll, 250);
+
+    const brainLogEl = document.getElementById("brainLog");
+    const driveLogEl = document.getElementById("driveLog");
+    let logAfter = 0;
+    const LOG_KEEP = { brain: 5000, drive: 500 };
+
+    function fmtTs(ts) {
+      const d = new Date((Number(ts) || 0) * 1000);
+      if (Number.isNaN(d.getTime()) || d.getFullYear() < 2000) return "—";
+      return d.toLocaleTimeString("en-GB", { hour12: false }) + "." +
+        String(d.getMilliseconds()).padStart(3, "0");
+    }
+
+    function shortLogger(name) {
+      const parts = String(name || "").split(".");
+      return parts[parts.length - 1] || name || "";
+    }
+
+    function makeLogLine(r) {
+      const div = document.createElement("div");
+      const lvl = String(r.level || "INFO").toLowerCase();
+      div.className = "log-line " + lvl;
+      const t = document.createElement("span");
+      t.className = "t";
+      t.textContent = fmtTs(r.ts);
+      div.appendChild(t);
+      div.appendChild(document.createTextNode(
+        lvl.toUpperCase() + " " + shortLogger(r.logger) + ": " + String(r.msg || "")
+      ));
+      return div;
+    }
+
+    function appendLogLines(el, rows, keep) {
+      if (!rows.length) return;
+      const stick = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+      const empty = el.querySelector(".log-empty");
+      if (empty) empty.remove();
+      const frag = document.createDocumentFragment();
+      for (const r of rows) frag.appendChild(makeLogLine(r));
+      el.appendChild(frag);
+      const lines = el.querySelectorAll(".log-line");
+      const extra = lines.length - keep;
+      if (extra > 0) {
+        for (let i = 0; i < extra; i++) lines[i].remove();
+      }
+      if (stick) el.scrollTop = el.scrollHeight;
+    }
+
+    async function pollLogs() {
+      try {
+        const res = await fetch("/api/logs?after=" + logAfter);
+        const data = await res.json();
+        appendLogLines(brainLogEl, data.brain || [], LOG_KEEP.brain);
+        appendLogLines(driveLogEl, data.drive || [], LOG_KEEP.drive);
+        if (typeof data.seq === "number") logAfter = data.seq;
+      } catch (_) { /* keep last pane */ }
+    }
+    pollLogs();
+    setInterval(pollLogs, 400);
   </script>
 </body>
 </html>
