@@ -12,6 +12,10 @@ Group=cvincent
 SupplementaryGroups=video render
 WorkingDirectory=/home/cvincent/Projects/01-Puppet/eyes
 Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/cvincent
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PULSE_RUNTIME_PATH=/run/user/1000/pulse
+Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
 Environment=PATH=/opt/nvidia/deepstream/deepstream/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 Environment=LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu:/usr/local/cuda/lib64
 AmbientCapabilities=CAP_NET_BIND_SERVICE

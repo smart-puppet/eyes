@@ -30,6 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[1]
+from mic_volume import get_default_mic, set_default_mic
 sys.path.insert(0, str(ROOT))
 
 from camera import DEFAULT_PRODUCT_ID, DEFAULT_VENDOR_ID, find_video_device  # noqa: E402
@@ -932,6 +933,10 @@ class LanguageRequest(BaseModel):
     language: str = Field(..., pattern="^(en|fr|de)$")
 
 
+class MicRequest(BaseModel):
+    percent: int = Field(..., ge=0, le=150)
+
+
 @app.on_event("startup")
 def _startup() -> None:
     global streamer, scene_publisher
@@ -1056,6 +1061,30 @@ def api_language() -> Dict[str, Any]:
     }
 
 
+@app.get("/api/mic")
+def api_mic() -> Dict[str, Any]:
+    try:
+        return get_default_mic()
+    except RuntimeError as exc:
+        raise HTTPException(503, f"could not read default mic: {exc}") from exc
+
+
+@app.post("/api/mic")
+def api_set_mic(body: MicRequest) -> Dict[str, Any]:
+    try:
+        result = set_default_mic(body.percent)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, f"could not set default mic: {exc}") from exc
+    logger.info(
+        "Default mic volume %s%% source=%s",
+        result.get("percent"),
+        result.get("source"),
+    )
+    return result
+
+
 @app.post("/api/language")
 def api_set_language(body: LanguageRequest) -> Dict[str, Any]:
     try:
@@ -1168,7 +1197,7 @@ def stream_mjpg() -> StreamingResponse:
 class _QuietAccessFilter(logging.Filter):
     """Drop high-frequency poll/stream access lines from uvicorn."""
 
-    _SKIP = ("/api/state", "/api/logs", "/stream.mjpg")
+    _SKIP = ("/api/state", "/api/logs", "/api/mic", "/stream.mjpg")
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()

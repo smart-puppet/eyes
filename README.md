@@ -17,6 +17,7 @@ bash scripts/run_debug_web.sh
 # open http://127.0.0.1:8091 — pick Traversability, press Capture
 # systemd (port 80 + mDNS): http://puppet.local  — see docs systemd.md
 # Language DE/EN/FR is saved to brain/config/language.active (applies on next brain start)
+# Mic slider sets PulseAudio default input volume immediately (no brain restart)
 # Clear logs empties the brain/drive panes
 # Brain and drive log panes appear once those processes publish robot/log/*
 # or: mosquitto_pub -t robot/nav/capture -m '{"req_id":"test","view":"traverse"}'
