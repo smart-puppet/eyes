@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>eyes debug web</title>
+  <title>Eye</title>
   <style>
     :root {
       --bg: #1a1f1c;
@@ -216,7 +216,7 @@
       cursor: wait;
     }
     .capture-btn:active:not(:disabled) { filter: brightness(0.92); }
-    label { font-size: 0.85rem; color: var(--muted); }
+    label { font-size: 0.85rem; color: var(--muted); min-width: 8.2rem; }
     input[type="range"] { flex: 1; min-width: 100px; }
     .val { min-width: 2.5rem; font-variant-numeric: tabular-nums; }
     .status {
@@ -304,8 +304,8 @@
   </style>
 </head>
 <body>
-  <h1>Eyes + drive</h1>
-  <p class="sub">MJPEG camera · Capture runs YOLO/depth/traverse once · hold arrows to drive (WASD) · STOP flushes MCU · language is saved for the next brain start · mic slider is the Pulse default input (live) · live brain/drive logs below</p>
+  <h1>Eye</h1>
+  <p class="sub">Camera · Capture · hold arrows to drive (WASD) · live follow/seek/forward speeds · STOP flushes MCU · language is saved for the next brain start · mic slider is the Pulse default input (live) · brain/drive logs below</p>
 
   <div class="layout">
     <div class="row">
@@ -346,10 +346,26 @@
           <button class="clear-btn" id="clearBtn" type="button">Clear estop</button>
         </div>
         <div class="row">
-          <label for="speed">Speed</label>
+          <label for="speed">Pad speed</label>
           <input id="speed" type="range" min="20" max="200" value="100" />
           <span class="val" id="speedVal">100</span>
         </div>
+        <div class="row">
+          <label for="followTurn">Follow turn</label>
+          <input id="followTurn" type="range" min="20" max="200" value="125" />
+          <span class="val" id="followTurnVal">125</span>
+        </div>
+        <div class="row">
+          <label for="seekTurn">Seek turn</label>
+          <input id="seekTurn" type="range" min="20" max="200" value="125" />
+          <span class="val" id="seekTurnVal">125</span>
+        </div>
+        <div class="row">
+          <label for="forwardSpeed">Forward</label>
+          <input id="forwardSpeed" type="range" min="20" max="200" value="105" />
+          <span class="val" id="forwardSpeedVal">105</span>
+        </div>
+        <span class="lang-note" id="speedsNote">Saved to disk — kept across restarts</span>
         <div class="row">
           <label for="ttl">Watchdog TTL (ms)</label>
           <input id="ttl" type="range" min="50" max="1000" step="50" value="300" />
@@ -389,6 +405,13 @@
     const ttlEl = document.getElementById("ttl");
     const speedVal = document.getElementById("speedVal");
     const ttlVal = document.getElementById("ttlVal");
+    const followTurnEl = document.getElementById("followTurn");
+    const seekTurnEl = document.getElementById("seekTurn");
+    const forwardSpeedEl = document.getElementById("forwardSpeed");
+    const followTurnVal = document.getElementById("followTurnVal");
+    const seekTurnVal = document.getElementById("seekTurnVal");
+    const forwardSpeedVal = document.getElementById("forwardSpeedVal");
+    const speedsNote = document.getElementById("speedsNote");
     const micEl = document.getElementById("mic");
     const micVal = document.getElementById("micVal");
     const micNote = document.getElementById("micNote");
@@ -498,6 +521,70 @@
     langEn.addEventListener("click", () => setLanguage("en"));
     langFr.addEventListener("click", () => setLanguage("fr"));
     loadLanguage();
+
+    function showSpeeds(data) {
+      if (typeof data.follow_turn === "number") {
+        followTurnEl.value = String(data.follow_turn);
+        followTurnVal.textContent = data.follow_turn;
+      }
+      if (typeof data.seek_turn === "number") {
+        seekTurnEl.value = String(data.seek_turn);
+        seekTurnVal.textContent = data.seek_turn;
+      }
+      if (typeof data.forward === "number") {
+        forwardSpeedEl.value = String(data.forward);
+        forwardSpeedVal.textContent = data.forward;
+      }
+      if (data.ok) {
+        speedsNote.textContent = data.note || "Saved to disk — kept across restarts";
+      }
+    }
+
+    async function loadSpeeds() {
+      try {
+        const res = await fetch("/api/speeds");
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.detail || res.statusText);
+        }
+        showSpeeds(data);
+      } catch (e) {
+        speedsNote.textContent = "Speeds: " + e.message;
+      }
+    }
+
+    let speedsTimer = null;
+    async function setSpeeds() {
+      const body = {
+        follow_turn: Number(followTurnEl.value),
+        seek_turn: Number(seekTurnEl.value),
+        forward: Number(forwardSpeedEl.value),
+      };
+      followTurnVal.textContent = body.follow_turn;
+      seekTurnVal.textContent = body.seek_turn;
+      forwardSpeedVal.textContent = body.forward;
+      try {
+        const data = await post("/api/speeds", body);
+        showSpeeds(data);
+      } catch (e) {
+        speedsNote.textContent = "Speeds error: " + e.message;
+      }
+    }
+    function onSpeedInput() {
+      followTurnVal.textContent = followTurnEl.value;
+      seekTurnVal.textContent = seekTurnEl.value;
+      forwardSpeedVal.textContent = forwardSpeedEl.value;
+      clearTimeout(speedsTimer);
+      speedsTimer = setTimeout(setSpeeds, 80);
+    }
+    [followTurnEl, seekTurnEl, forwardSpeedEl].forEach((el) => {
+      el.addEventListener("input", onSpeedInput);
+      el.addEventListener("change", () => {
+        clearTimeout(speedsTimer);
+        setSpeeds();
+      });
+    });
+    loadSpeeds();
 
     function showMic(data) {
       if (typeof data.percent === "number") {

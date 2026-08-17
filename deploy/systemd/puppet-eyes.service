@@ -1,5 +1,5 @@
 [Unit]
-Description=Puppet eyes debug web and scene capture
+Description=Puppet Eye
 Documentation=https://github.com/smart-puppet/docs/blob/main/systemd.md
 After=network.target mosquitto.service puppet-drive.service
 Wants=mosquitto.service puppet-drive.service

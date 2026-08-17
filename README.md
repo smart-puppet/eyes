@@ -6,7 +6,7 @@ Stack overview: [architecture](https://github.com/smart-puppet/docs/blob/main/ar
 
 Inference is **on demand** (not continuous):
 
-- Debug web **Capture** button, or
+- Eye **Capture** button, or
 - MQTT `robot/nav/capture` (brain) → publishes `robot/nav/scene`
 
 ## Quick start
@@ -14,9 +14,10 @@ Inference is **on demand** (not continuous):
 ```bash
 # Preview + capture API / MQTT listener
 bash scripts/run_debug_web.sh
-# open http://127.0.0.1:8091 — pick Traversability, press Capture
+# open http://127.0.0.1:8091 — Eye UI (camera, drive, play speeds)
 # systemd (port 80 + mDNS): http://puppet.local  — see docs systemd.md
 # Language DE/EN/FR is saved to brain/config/language.active (applies on next brain start)
+# Follow / seek / forward sliders apply live (brain/config/play.speeds + robot/play/speeds)
 # Mic slider sets PulseAudio default input volume immediately (no brain restart)
 # Clear logs empties the brain/drive panes
 # Brain and drive log panes appear once those processes publish robot/log/*

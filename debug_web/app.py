@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Debug web for eyes: MJPEG + on-demand capture + robot drive pad (MQTT).
+"""Eye: MJPEG camera, on-demand capture, drive pad, and live play speeds.
 
-UI shell mirrors drive/debug_web. Video is OpenCV capture; YOLO / DA-V2 /
-Fast-SCNN run on Capture (HTTP or robot/nav/capture). Drive arrows publish
-to robot/drive/*.
+Video is OpenCV capture; YOLO / DA-V2 / Fast-SCNN run on Capture (HTTP or
+robot/nav/capture). Drive arrows publish to robot/drive/*. Play speed sliders
+write brain/config/play.speeds and robot/play/speeds.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[1]
 from mic_volume import get_default_mic, set_default_mic
+from play_speeds import read_play_speeds, write_play_speeds
 sys.path.insert(0, str(ROOT))
 
 from camera import DEFAULT_PRODUCT_ID, DEFAULT_VENDOR_ID, find_video_device  # noqa: E402
@@ -157,7 +158,7 @@ def _print_access_urls(host: str, port: int) -> None:
     elif host not in ("127.0.0.1", "localhost"):
         urls.append(_http_url(host, port))
     seen: set[str] = set()
-    logger.info("Eyes debug web listening — open:")
+    logger.info("Eye listening — open:")
     for u in urls:
         if u in seen:
             continue
@@ -714,7 +715,7 @@ class DriveBridge:
     def start(self) -> None:
         self.client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
-            client_id=f"eyes_debug_web_{os.getpid()}",
+            client_id=f"eye_{os.getpid()}",
         )
         if self.username:
             self.client.username_pw_set(self.username, self.password)
@@ -848,6 +849,16 @@ class DriveBridge:
         logger.info("MQTT send %s {}", self._topic("stop"))
         self.client.publish(self._topic("stop"), "{}", qos=1)
 
+    def publish_play_speeds(self, speeds: Dict[str, int]) -> bool:
+        """Tell brain to apply follow/seek/forward speeds live (retained)."""
+        if not self.client:
+            return False
+        topic = "robot/play/speeds"
+        payload = json.dumps(speeds)
+        logger.info("MQTT send %s %s", topic, payload)
+        self.client.publish(topic, payload, qos=1, retain=True)
+        return True
+
     def _hb_loop(self) -> None:
         while self._running:
             with self._lock:
@@ -911,7 +922,7 @@ class DriveBridge:
 
 bridge = DriveBridge()
 
-app = FastAPI(title="eyes debug web", version="0.1.0")
+app = FastAPI(title="Eye", version="0.1.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -935,6 +946,12 @@ class LanguageRequest(BaseModel):
 
 class MicRequest(BaseModel):
     percent: int = Field(..., ge=0, le=150)
+
+
+class SpeedsRequest(BaseModel):
+    follow_turn: int = Field(..., ge=20, le=200)
+    seek_turn: int = Field(..., ge=20, le=200)
+    forward: int = Field(..., ge=20, le=200)
 
 
 @app.on_event("startup")
@@ -1085,6 +1102,57 @@ def api_set_mic(body: MicRequest) -> Dict[str, Any]:
     return result
 
 
+@app.get("/api/speeds")
+def api_speeds() -> Dict[str, Any]:
+    config_dir = _brain_config_dir()
+    speeds, exists = read_play_speeds(config_dir)
+    return {
+        "ok": True,
+        **speeds,
+        "exists": exists,
+        "file": str(config_dir / "play.speeds"),
+        "applies": "live",
+        "note": "Saved to play.speeds — kept across restarts",
+    }
+
+
+@app.post("/api/speeds")
+def api_set_speeds(body: SpeedsRequest) -> Dict[str, Any]:
+    try:
+        path, speeds = write_play_speeds(
+            _brain_config_dir(),
+            {
+                "follow_turn": body.follow_turn,
+                "seek_turn": body.seek_turn,
+                "forward": body.forward,
+            },
+        )
+    except OSError as exc:
+        raise HTTPException(500, f"could not write play speeds: {exc}") from exc
+    mqtt_ok = False
+    try:
+        mqtt_ok = bridge.publish_play_speeds(speeds)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Play speeds MQTT failed: %s", exc)
+    logger.info(
+        "Play speeds follow_turn=%s seek_turn=%s forward=%s → %s mqtt=%s",
+        speeds["follow_turn"],
+        speeds["seek_turn"],
+        speeds["forward"],
+        path,
+        mqtt_ok,
+    )
+    return {
+        "ok": True,
+        **speeds,
+        "exists": True,
+        "file": str(path),
+        "mqtt": mqtt_ok,
+        "applies": "live" if mqtt_ok else "brain_start",
+        "note": "Saved to play.speeds — kept across restarts",
+    }
+
+
 @app.post("/api/language")
 def api_set_language(body: LanguageRequest) -> Dict[str, Any]:
     try:
@@ -1197,7 +1265,7 @@ def stream_mjpg() -> StreamingResponse:
 class _QuietAccessFilter(logging.Filter):
     """Drop high-frequency poll/stream access lines from uvicorn."""
 
-    _SKIP = ("/api/state", "/api/logs", "/api/mic", "/stream.mjpg")
+    _SKIP = ("/api/state", "/api/logs", "/api/mic", "/api/speeds", "/stream.mjpg")
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
@@ -1205,7 +1273,7 @@ class _QuietAccessFilter(logging.Filter):
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="eyes debug web (MJPEG + drive pad)")
+    p = argparse.ArgumentParser(description="Eye (camera, drive pad, play speeds)")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8091)
     p.add_argument("--device", default=None)
@@ -1249,7 +1317,7 @@ def main() -> None:
     p.add_argument(
         "--brain-config",
         default=os.environ.get("PUPPET_CONFIG_DIR", str(DEFAULT_BRAIN_CONFIG)),
-        help="Brain config dir for language.active (default: sibling brain/config)",
+        help="Brain config dir for language.active and play.speeds (default: sibling brain/config)",
     )
     args = p.parse_args()
 
@@ -1318,7 +1386,7 @@ def main() -> None:
     logger.info("View   %s", view)
     logger.info("MQTT   %s:%s  drive=%s", args.broker, args.broker_port, args.prefix)
     logger.info("Scene  %s  capture=%s", args.scene_topic, args.capture_topic)
-    logger.info("Lang   %s (language.active)", args.brain_config)
+    logger.info("Lang   %s (language.active + play.speeds)", args.brain_config)
     _print_access_urls(args.host, args.port)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
