@@ -1020,7 +1020,7 @@ def _startup() -> None:
         yolo_path=Path(_cfg.get("yolo", DEFAULT_YOLO)),
         depth_path=Path(_cfg.get("depth", DEFAULT_DEPTH)),
         scnn_path=Path(_cfg.get("scnn", DEFAULT_SCNN)),
-        conf=float(_cfg.get("conf", 0.25)),
+        conf=float(_cfg.get("conf", 0.50)),
         iou=float(_cfg.get("iou", 0.45)),
         jpeg_quality=int(_cfg.get("jpeg_quality", 80)),
         overlay=bool(_cfg.get("overlay", False)),
@@ -1291,7 +1291,7 @@ def main() -> None:
     p.add_argument("--yolo", type=Path, default=DEFAULT_YOLO)
     p.add_argument("--depth", type=Path, default=DEFAULT_DEPTH)
     p.add_argument("--scnn", type=Path, default=DEFAULT_SCNN)
-    p.add_argument("--conf", type=float, default=0.25)
+    p.add_argument("--conf", type=float, default=0.50)
     p.add_argument("--iou", type=float, default=0.45)
     p.add_argument("--jpeg-quality", type=int, default=80)
     p.add_argument(

@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--yolo", type=Path, default=DEFAULT_YOLO)
     p.add_argument("--midas", type=Path, default=DEFAULT_MIDAS)
-    p.add_argument("--conf", type=float, default=0.4)
+    p.add_argument("--conf", type=float, default=0.50)
     p.add_argument("--iou", type=float, default=0.45)
     p.add_argument(
         "--depth-scale",

@@ -21,5 +21,5 @@ custom-lib-path=libnvdsinfer_yolov8_parser.so
 
 [class-attrs-all]
 nms-iou-threshold=0.45
-pre-cluster-threshold=0.4
+pre-cluster-threshold=0.50
 topk=50

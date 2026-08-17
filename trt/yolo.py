@@ -111,7 +111,7 @@ def _nms(boxes: np.ndarray, scores: np.ndarray, iou_thres: float) -> List[int]:
 def postprocess_yolo(
     output: np.ndarray,
     info: LetterboxInfo,
-    conf_thres: float = 0.4,
+    conf_thres: float = 0.50,
     iou_thres: float = 0.45,
     max_det: int = 50,
 ) -> List[Detection]:
@@ -162,7 +162,7 @@ def postprocess_yolo(
 def postprocess_yolo_end2end(
     output: np.ndarray,
     info: LetterboxInfo,
-    conf_thres: float = 0.4,
+    conf_thres: float = 0.50,
     max_det: int = 50,
 ) -> List[Detection]:
     """Parse DeepStream-Yolo / YOLO26 end2end output shaped [1, N, 6] or [N, 6].
