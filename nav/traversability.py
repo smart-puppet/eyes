@@ -47,6 +47,44 @@ def _bearing(cx: float, frame_w: int) -> str:
     return "center"
 
 
+def depth_floor_mask(
+    depth: np.ndarray,
+    *,
+    camera_h_m: float = 0.12,
+    band_m: float = 0.10,
+    fy: Optional[float] = None,
+) -> np.ndarray:
+    """Mark pixels whose pinhole height matches the floor.
+
+    Fast-SCNN is Cityscapes (road / sidewalk / terrain). Indoor wood and tile
+    often miss that palette, so metric depth is the apartment ground prior —
+    no extra TensorRT net.
+    """
+    z = np.asarray(depth, dtype=np.float32)
+    if z.ndim != 2 or z.size == 0:
+        return np.zeros_like(z, dtype=bool)
+    h, w = z.shape[:2]
+    if fy is None:
+        fy = 0.9 * float(max(w, 1))
+    cy = (h - 1) * 0.45
+    rows = np.arange(h, dtype=np.float32)[:, None]
+    valid = np.isfinite(z) & (z > 0.28) & (z < 4.0)
+    y_cam = (rows - cy) * z / max(float(fy), 1e-3)
+    # Close vertical surfaces also sit near camera height; only trust the plane farther out.
+    plane = valid & (z >= 0.75) & (np.abs(y_cam - camera_h_m) <= band_m)
+    # Floor: depth increases toward the top of the image. A wall stays roughly constant.
+    shift = max(6, h // 12)
+    z_up = np.full_like(z, np.nan)
+    z_up[shift:, :] = z[:-shift, :]
+    rising = (
+        valid
+        & (rows >= (h * 0.36))
+        & np.isfinite(z_up)
+        & ((z_up - z) > 0.05)
+    )
+    return plane | rising
+
+
 def _sector_ranges(
     depth: np.ndarray,
     free: np.ndarray,
@@ -67,15 +105,54 @@ def _sector_ranges(
         roi_d = depth[y0:h, x0:x1]
         roi_f = free[y0:h, x0:x1]
         valid = np.isfinite(roi_d) & (roi_d > d_min) & (roi_d < d_max)
-        # Prefer free pixels; fall back to any valid depth.
-        use = valid & roi_f
-        if not use.any():
-            use = valid
-        if not use.any():
-            out[name] = float("nan")
+        # Distance to obstacles, not to the floor (wood at ~1 m is not a wall).
+        obstacle = valid & ~roi_f
+        if obstacle.any():
+            out[name] = float(np.percentile(roi_d[obstacle], 10.0))
         else:
-            out[name] = float(np.percentile(roi_d[use], 10.0))
+            out[name] = float(d_max)
     return out
+
+
+def clean_floor_mask(floor: np.ndarray) -> np.ndarray:
+    """Fill Fast-SCNN speckles/holes on the ground. CPU-only, no extra TRT."""
+    mask = np.asarray(floor, dtype=np.uint8)
+    if mask.ndim != 2 or mask.size == 0:
+        return np.asarray(floor, dtype=bool)
+    h, w = mask.shape[:2]
+    y0 = int(h * 0.32)
+    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    ground = cv2.morphologyEx(mask[y0:], cv2.MORPH_CLOSE, close_k)
+    ground = cv2.morphologyEx(ground, cv2.MORPH_OPEN, open_k)
+    mask = mask.copy()
+    mask[y0:] = ground
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, open_k)
+    return mask.astype(bool)
+
+
+class FloorSmoother:
+    """Blend the last floor mask so one noisy capture does not punch a hole."""
+
+    def __init__(self, alpha: float = 0.58, thresh: float = 0.38) -> None:
+        self.alpha = float(alpha)
+        self.thresh = float(thresh)
+        self._ema: Optional[np.ndarray] = None
+        self._ts = 0.0
+
+    def reset(self) -> None:
+        self._ema = None
+        self._ts = 0.0
+
+    def update(self, floor: np.ndarray, *, now: Optional[float] = None) -> np.ndarray:
+        stamp = time.time() if now is None else float(now)
+        cleaned = clean_floor_mask(floor).astype(np.float32)
+        if self._ema is None or self._ema.shape != cleaned.shape or stamp - self._ts > 2.5:
+            self._ema = cleaned
+        else:
+            self._ema = self.alpha * cleaned + (1.0 - self.alpha) * self._ema
+        self._ts = stamp
+        return self._ema >= self.thresh
 
 
 def _apply_yolo_nogo(
@@ -83,6 +160,11 @@ def _apply_yolo_nogo(
     detections: Sequence[Detection],
     frame_hw: Tuple[int, int],
 ) -> np.ndarray:
+    """Block the floor *contact* of obstacles, not the whole tall bbox.
+
+    A standing person / mislabeled fridge otherwise paints a vertical rectangle
+    of no-go across good floor in front of the camera.
+    """
     h, w = frame_hw
     out = free.copy()
     for det in detections:
@@ -92,8 +174,14 @@ def _apply_yolo_nogo(
         y1 = int(np.clip(det.y1, 0, h - 1))
         x2 = int(np.clip(det.x2, 0, w - 1))
         y2 = int(np.clip(det.y2, 0, h - 1))
-        if x2 > x1 and y2 > y1:
-            out[y1:y2, x1:x2] = False
+        if x2 <= x1 or y2 <= y1:
+            continue
+        box_h = y2 - y1
+        y_contact = y1 + int(box_h * 0.5)
+        pad = max(2, (x2 - x1) // 12)
+        xa = max(0, x1 - pad)
+        xb = min(w, x2 + pad)
+        out[y_contact:y2, xa:xb] = False
     return out
 
 
@@ -179,14 +267,26 @@ def build_scene(
     d_max: float = 4.0,
     closest_m: float = float("nan"),
 ) -> SceneSummary:
+    # Full-frame nearest depth is usually the floor under a low camera; ignore it.
+    _ = closest_m
     h, w = frame_hw
-    free = floor_mask & np.isfinite(depth_m) & (depth_m >= d_min) & (depth_m <= d_max)
+    scnn = clean_floor_mask(floor_mask)
+    geo = depth_floor_mask(depth_m)
+    floor = clean_floor_mask(scnn | geo)
+    free = floor & np.isfinite(depth_m) & (depth_m >= d_min) & (depth_m <= d_max)
     free = _apply_yolo_nogo(free, detections, (h, w))
 
     sectors = _sector_ranges(depth_m, free, d_min=d_min, d_max=d_max)
     y0 = int(h * 0.45)
     ahead = free[y0:h, :]
     floor_ahead_pct = float(ahead.mean()) if ahead.size else 0.0
+
+    obstacle = np.isfinite(depth_m) & (depth_m >= d_min) & (depth_m <= d_max) & ~free
+    occ = obstacle[y0:h, :]
+    if occ.any():
+        closest_m = float(np.percentile(depth_m[y0:h][occ], 5.0))
+    else:
+        closest_m = float(d_max)
 
     objects: List[Dict[str, Any]] = []
     for det in detections:

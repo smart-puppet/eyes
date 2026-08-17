@@ -8,7 +8,8 @@ import cv2
 import numpy as np
 
 # Cityscapes trainId palette (19 classes) — Fast-SCNN PINTO outputs class indices.
-CITYSCAPES_FLOOR = {0, 1}  # road, sidewalk
+# Indoor wood/tile often lands on road, sidewalk, or terrain — not a second net.
+CITYSCAPES_FLOOR = {0, 1, 9}  # road, sidewalk, terrain
 CITYSCAPES_WALL = {2, 3, 4}  # building, wall, fence
 
 # ImageNet-ish / Cityscapes common preprocess for PINTO Fast-SCNN demos.

@@ -6,14 +6,24 @@ from .fast_scnn import (
     remap_apartment,
     resize_mask_to_frame,
 )
-from .traversability import SceneSummary, build_scene, overlay_traversability
+from .traversability import (
+    FloorSmoother,
+    SceneSummary,
+    build_scene,
+    clean_floor_mask,
+    depth_floor_mask,
+    overlay_traversability,
+)
 
 __all__ = [
     "preprocess_fast_scnn",
     "logits_to_labels",
     "remap_apartment",
     "resize_mask_to_frame",
+    "FloorSmoother",
     "SceneSummary",
     "build_scene",
+    "clean_floor_mask",
+    "depth_floor_mask",
     "overlay_traversability",
 ]

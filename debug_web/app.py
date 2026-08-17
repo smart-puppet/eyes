@@ -42,7 +42,11 @@ from nav.fast_scnn import (  # noqa: E402
     resize_mask_to_frame,
 )
 from nav.mqtt_scene import ScenePublisher  # noqa: E402
-from nav.traversability import build_scene, overlay_traversability  # noqa: E402
+from nav.traversability import (  # noqa: E402
+    FloorSmoother,
+    build_scene,
+    overlay_traversability,
+)
 from trt import (  # noqa: E402
     TrtEngine,
     attach_metric_distances,
@@ -271,6 +275,7 @@ class EyesStreamer:
         self._capture_done = threading.Event()
         self._capture_error: Optional[str] = None
         self._pending_req_id: Optional[str] = None
+        self._floor = FloorSmoother()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -534,6 +539,7 @@ class EyesStreamer:
                                     labels = logits_to_labels(scnn_out)
                                     floor, _wall, _other = remap_apartment(labels)
                                     floor_mask = resize_mask_to_frame(floor, frame.shape[:2])
+                                    floor_mask = self._floor.update(floor_mask)
                                     scene = build_scene(
                                         depth_m=depth_map,
                                         floor_mask=floor_mask,
