@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parents[1]
 from mic_volume import get_default_mic, set_default_mic
 from play_speeds import read_play_speeds, write_play_speeds
+from languages import list_language_profiles, parse_language_id
 sys.path.insert(0, str(ROOT))
 
 from camera import DEFAULT_PRODUCT_ID, DEFAULT_VENDOR_ID, find_video_device  # noqa: E402
@@ -69,8 +70,7 @@ HB_PERIOD_S = 0.15
 LOG_MAX_BRAIN = 5000
 LOG_MAX_DRIVE = 500
 LOG_TOPIC = "robot/log/+"
-LANGUAGE_CODES = ("en", "fr", "de")
-DEFAULT_LANGUAGE = "de"
+DEFAULT_LANGUAGE = "de_1"
 DEFAULT_BRAIN_CONFIG = Path(__file__).resolve().parents[2] / "brain" / "config"
 
 
@@ -85,8 +85,7 @@ def _parse_language_code(text: str) -> Optional[str]:
   first = (text or "").strip().splitlines()
   if not first:
     return None
-  code = first[0].strip().lower().strip("'\"")
-  return code if code in LANGUAGE_CODES else None
+  return parse_language_id(first[0])
 
 
 def _read_saved_language(config_dir: Path) -> tuple[str, bool]:
@@ -103,9 +102,10 @@ def _read_saved_language(config_dir: Path) -> tuple[str, bool]:
 
 
 def _write_saved_language(config_dir: Path, language: str) -> Path:
-  code = str(language or "").strip().lower()
-  if code not in LANGUAGE_CODES:
-    raise ValueError("language must be en, fr, or de")
+  code = parse_language_id(str(language or ""))
+  known = {item["id"] for item in list_language_profiles(config_dir)}
+  if not code or (known and code not in known):
+    raise ValueError("language must be a listed profile such as en_1, fr_1, de_1, or de_2")
   config_dir.mkdir(parents=True, exist_ok=True)
   path = config_dir / "language.active"
   tmp = path.with_name("language.active.tmp")
@@ -947,7 +947,7 @@ class HoldRequest(BaseModel):
 
 
 class LanguageRequest(BaseModel):
-    language: str = Field(..., pattern="^(en|fr|de)$")
+    language: str = Field(..., pattern=r"^(en|fr|de)(_[1-9]\d*)?$")
 
 
 class MicRequest(BaseModel):
@@ -1074,10 +1074,15 @@ def api_logs_clear() -> Dict[str, Any]:
 def api_language() -> Dict[str, Any]:
     config_dir = _brain_config_dir()
     language, exists = _read_saved_language(config_dir)
+    profiles = list_language_profiles(config_dir)
+    known = {item["id"] for item in profiles}
+    if known and language not in known:
+      language = DEFAULT_LANGUAGE if DEFAULT_LANGUAGE in known else (profiles[0]["id"] if profiles else language)
     return {
         "ok": True,
         "language": language,
         "exists": exists,
+        "profiles": profiles,
         "file": str(config_dir / "language.active"),
         "applies": "brain_start",
         "note": "Takes effect the next time brain starts",
@@ -1168,10 +1173,12 @@ def api_set_language(body: LanguageRequest) -> Dict[str, Any]:
     except OSError as exc:
         raise HTTPException(500, f"could not write language file: {exc}") from exc
     logger.info("Saved brain language %s → %s (applies on brain start)", body.language, path)
+    code = parse_language_id(body.language) or body.language
     return {
         "ok": True,
-        "language": body.language,
+        "language": code,
         "exists": True,
+        "profiles": list_language_profiles(_brain_config_dir()),
         "file": str(path),
         "applies": "brain_start",
         "note": "Takes effect the next time brain starts",

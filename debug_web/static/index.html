@@ -104,10 +104,15 @@
     .badge.err { color: #ff8a7a; background: #4a2a28; }
     .toggle {
       display: inline-flex;
+      flex-wrap: wrap;
       border: 1px solid var(--border);
       border-radius: 0.75rem;
       overflow: hidden;
       background: var(--btn);
+    }
+    .toggle.lang {
+      overflow: visible;
+      max-width: 100%;
     }
     .toggle button {
       border: none;
@@ -319,11 +324,7 @@
         <button type="button" id="btnTraverse">Traversability</button>
       </div>
       <button type="button" class="capture-btn" id="captureBtn">Capture</button>
-      <div class="toggle" role="group" aria-label="Brain language">
-        <button type="button" id="langDe">DE</button>
-        <button type="button" id="langEn">EN</button>
-        <button type="button" id="langFr">FR</button>
-      </div>
+      <div class="toggle lang" id="langToggle" role="group" aria-label="Brain language"></div>
       <span class="lang-note" id="langNote">Language applies when brain starts</span>
     </div>
 
@@ -397,9 +398,7 @@
     const btnOverlay = document.getElementById("btnOverlay");
     const btnTraverse = document.getElementById("btnTraverse");
     const captureBtn = document.getElementById("captureBtn");
-    const langDe = document.getElementById("langDe");
-    const langEn = document.getElementById("langEn");
-    const langFr = document.getElementById("langFr");
+    const langToggle = document.getElementById("langToggle");
     const langNote = document.getElementById("langNote");
     const speedEl = document.getElementById("speed");
     const ttlEl = document.getElementById("ttl");
@@ -488,17 +487,31 @@
     });
     syncCaptureBtn();
 
+    function renderLanguageButtons(profiles, active) {
+      langToggle.replaceChildren();
+      (profiles || []).forEach((profile) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.dataset.lang = profile.id;
+        btn.textContent = profile.button || profile.id;
+        btn.title = profile.label || profile.id;
+        btn.classList.toggle("active", profile.id === active);
+        btn.addEventListener("click", () => setLanguage(profile.id));
+        langToggle.appendChild(btn);
+      });
+    }
+
     function syncLanguage(code) {
-      langDe.classList.toggle("active", code === "de");
-      langEn.classList.toggle("active", code === "en");
-      langFr.classList.toggle("active", code === "fr");
+      langToggle.querySelectorAll("button").forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.lang === code);
+      });
     }
 
     async function loadLanguage() {
       try {
         const res = await fetch("/api/language");
         const data = await res.json();
-        syncLanguage(data.language || "de");
+        renderLanguageButtons(data.profiles || [], data.language || "de_1");
         langNote.textContent = data.exists
           ? "Saved " + String(data.language).toUpperCase() + " — restart brain to apply"
           : "No file yet — brain starts in German until you pick one";
@@ -511,15 +524,12 @@
       syncLanguage(code);
       try {
         await post("/api/language", { language: code });
-        langNote.textContent = "Saved " + code.toUpperCase() + " — restart brain to apply";
+        langNote.textContent = "Saved " + String(code).toUpperCase() + " — restart brain to apply";
       } catch (e) {
         langNote.textContent = "Language error: " + e.message;
         await loadLanguage();
       }
     }
-    langDe.addEventListener("click", () => setLanguage("de"));
-    langEn.addEventListener("click", () => setLanguage("en"));
-    langFr.addEventListener("click", () => setLanguage("fr"));
     loadLanguage();
 
     function showSpeeds(data) {

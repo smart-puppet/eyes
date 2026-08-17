@@ -16,7 +16,7 @@ Inference is **on demand** (not continuous):
 bash scripts/run_debug_web.sh
 # open http://127.0.0.1:8091 — Eye UI (camera, drive, play speeds)
 # systemd (port 80 + mDNS): http://puppet.local  — see docs systemd.md
-# Language DE/EN/FR is saved to brain/config/language.active (applies on next brain start)
+# Language buttons (EN 1, DE 2, …) are saved to brain/config/language.active (applies on next brain start)
 # Follow / seek / forward sliders apply live (brain/config/play.speeds + robot/play/speeds)
 # Mic slider sets PulseAudio default input volume immediately (no brain restart)
 # Clear logs empties the brain/drive panes
