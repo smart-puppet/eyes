@@ -58,7 +58,7 @@ logger = logging.getLogger("eyes")
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-DEFAULT_YOLO = ROOT / "models" / "yolo26n_fp16.engine"
+DEFAULT_YOLO = ROOT / "models" / "yolov8n_fp16.engine"
 DEFAULT_DEPTH = ROOT / "models" / "dav2_metric_indoor_small_518_int8.engine"
 DEFAULT_SCNN = ROOT / "models" / "fast_scnn_256x640_fp16.engine"
 HB_PERIOD_S = 0.15
