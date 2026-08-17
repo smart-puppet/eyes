@@ -77,3 +77,24 @@ def test_build_scene_reports_wall_not_floor() -> None:
   )
   assert scene.payload["closest_m"] < 0.7
   assert scene.payload["sectors"]["center"] < 0.7
+  assert scene.payload["wall_ahead_m"] < 0.7
+  assert scene.free_mask[int(h * 0.7), w // 2] == False
+
+
+def test_build_scene_kallax_face_is_not_free() -> None:
+  h, w = 48, 64
+  depth = np.full((h, w), 0.62, dtype=np.float32)
+  # Fast-SCNN often paints a horizontal band of "floor" on furniture.
+  painted = np.zeros((h, w), dtype=bool)
+  painted[int(h * 0.4) : int(h * 0.7), :] = True
+  scene = build_scene(
+    depth_m=depth,
+    floor_mask=painted,
+    detections=[],
+    frame_hw=(h, w),
+    closest_m=0.58,
+  )
+  assert scene.payload["closest_m"] < 0.75
+  assert scene.payload["wall_ahead_m"] < 0.75
+  assert scene.payload["floor_ahead_pct"] < 0.2
+  assert scene.free_mask[int(h * 0.55), w // 2] == False

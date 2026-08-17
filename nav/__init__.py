@@ -13,6 +13,8 @@ from .traversability import (
     clean_floor_mask,
     depth_floor_mask,
     overlay_traversability,
+    vertical_face_mask,
+    wall_ahead_m,
 )
 
 __all__ = [
@@ -26,4 +28,6 @@ __all__ = [
     "clean_floor_mask",
     "depth_floor_mask",
     "overlay_traversability",
+    "vertical_face_mask",
+    "wall_ahead_m",
 ]

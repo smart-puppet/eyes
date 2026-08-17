@@ -47,6 +47,77 @@ def _bearing(cx: float, frame_w: int) -> str:
     return "center"
 
 
+def _band_percentile(
+    depth: np.ndarray,
+    y0f: float,
+    y1f: float,
+    x0f: float,
+    x1f: float,
+    *,
+    d_min: float,
+    d_max: float,
+    pct: float,
+) -> float:
+    h, w = depth.shape[:2]
+    y0, y1 = int(h * y0f), max(int(h * y0f) + 1, int(h * y1f))
+    x0, x1 = int(w * x0f), max(int(w * x0f) + 1, int(w * x1f))
+    roi = depth[y0:y1, x0:x1]
+    valid = np.isfinite(roi) & (roi > d_min) & (roi < d_max)
+    if not valid.any():
+        return float("nan")
+    return float(np.percentile(roi[valid], pct))
+
+
+def wall_ahead_m(
+    depth: np.ndarray,
+    *,
+    d_min: float = 0.25,
+    d_max: float = 4.0,
+) -> float:
+    """Distance to a close vertical face filling the camera, or NaN.
+
+    Floor gets farther toward the top of the image. A dresser / Kallax / wall
+    stays about the same distance in the middle and the bottom.
+    """
+    z = np.asarray(depth, dtype=np.float32)
+    if z.ndim != 2 or z.size == 0:
+        return float("nan")
+    lower = _band_percentile(z, 0.68, 0.95, 0.22, 0.78, d_min=d_min, d_max=d_max, pct=20.0)
+    mid = _band_percentile(z, 0.36, 0.60, 0.22, 0.78, d_min=d_min, d_max=d_max, pct=20.0)
+    if not (np.isfinite(lower) and np.isfinite(mid)):
+        return float("nan")
+    if mid < 1.15 and lower < 1.15 and abs(mid - lower) < 0.28:
+        return float(min(mid, lower))
+    return float("nan")
+
+
+def vertical_face_mask(depth: np.ndarray) -> np.ndarray:
+    """Columns whose depth barely changes down the frame are furniture or walls."""
+    z = np.asarray(depth, dtype=np.float32)
+    if z.ndim != 2 or z.size == 0:
+        return np.zeros_like(z, dtype=bool)
+    h, w = z.shape[:2]
+    y0 = int(h * 0.32)
+    band = z[y0:, :]
+    finite = np.isfinite(band)
+    if not finite.any():
+        return np.zeros((h, w), dtype=bool)
+    filled = np.where(finite, band, np.nan)
+    with np.errstate(all="ignore"):
+        col_std = np.nanstd(filled, axis=0)
+        col_med = np.nanmedian(filled, axis=0)
+    wall_cols = (
+        np.isfinite(col_std)
+        & np.isfinite(col_med)
+        & (col_std < 0.20)
+        & (col_med > 0.28)
+        & (col_med < 1.35)
+    )
+    mask = np.zeros((h, w), dtype=bool)
+    mask[int(h * 0.22) :, wall_cols] = True
+    return mask
+
+
 def depth_floor_mask(
     depth: np.ndarray,
     *,
@@ -58,7 +129,7 @@ def depth_floor_mask(
 
     Fast-SCNN is Cityscapes (road / sidewalk / terrain). Indoor wood and tile
     often miss that palette, so metric depth is the apartment ground prior —
-    no extra TensorRT net.
+    no extra TensorRT net. Close vertical furniture must stay blocked.
     """
     z = np.asarray(depth, dtype=np.float32)
     if z.ndim != 2 or z.size == 0:
@@ -68,21 +139,22 @@ def depth_floor_mask(
         fy = 0.9 * float(max(w, 1))
     cy = (h - 1) * 0.45
     rows = np.arange(h, dtype=np.float32)[:, None]
-    valid = np.isfinite(z) & (z > 0.28) & (z < 4.0)
+    valid = np.isfinite(z) & (z > 0.22) & (z < 4.0)
     y_cam = (rows - cy) * z / max(float(fy), 1e-3)
-    # Close vertical surfaces also sit near camera height; only trust the plane farther out.
-    plane = valid & (z >= 0.75) & (np.abs(y_cam - camera_h_m) <= band_m)
+    # Furniture at ~0.6–1.1 m also sits near camera height; only trust far floor.
+    plane = valid & (z >= 1.35) & (np.abs(y_cam - camera_h_m) <= band_m)
     # Floor: depth increases toward the top of the image. A wall stays roughly constant.
-    shift = max(6, h // 12)
+    shift = max(8, h // 8)
     z_up = np.full_like(z, np.nan)
     z_up[shift:, :] = z[:-shift, :]
     rising = (
         valid
-        & (rows >= (h * 0.36))
+        & (rows >= (h * 0.42))
         & np.isfinite(z_up)
-        & ((z_up - z) > 0.05)
+        & ((z_up - z) > 0.10)
+        & (z_up > z * 1.15)
     )
-    return plane | rising
+    return (plane | rising) & ~vertical_face_mask(z)
 
 
 def _sector_ranges(
@@ -232,10 +304,10 @@ def _bev_from_depth_free(
     inside = (col >= 0) & (col < gw) & (row >= 0) & (row < gh)
     col, row, free_v = col[inside], row[inside], free_v[inside]
 
-    # Occupied first, then free (free wins if both — prefer optimistic for planner later).
+    # Free first, then occupied (occupied wins — a dresser face must not stay green).
     occ = ~free_v
-    bev[row[occ], col[occ]] = 100
     bev[row[free_v], col[free_v]] = 0
+    bev[row[occ], col[occ]] = 100
     return bev
 
 
@@ -272,7 +344,7 @@ def build_scene(
     h, w = frame_hw
     scnn = clean_floor_mask(floor_mask)
     geo = depth_floor_mask(depth_m)
-    floor = clean_floor_mask(scnn | geo)
+    floor = clean_floor_mask(scnn | geo) & ~vertical_face_mask(depth_m)
     free = floor & np.isfinite(depth_m) & (depth_m >= d_min) & (depth_m <= d_max)
     free = _apply_yolo_nogo(free, detections, (h, w))
 
@@ -287,6 +359,12 @@ def build_scene(
         closest_m = float(np.percentile(depth_m[y0:h][occ], 5.0))
     else:
         closest_m = float(d_max)
+    wall_m = wall_ahead_m(depth_m, d_min=d_min, d_max=d_max)
+    if np.isfinite(wall_m) and wall_m < closest_m:
+        closest_m = float(wall_m)
+        center = sectors.get("center", float("nan"))
+        if not np.isfinite(center) or wall_m < center:
+            sectors["center"] = float(wall_m)
 
     objects: List[Dict[str, Any]] = []
     for det in detections:
@@ -341,6 +419,7 @@ def build_scene(
         "closest_m": None if not np.isfinite(closest_m) else round(float(closest_m), 2),
         "sectors": {k: _round_sec(v) for k, v in sectors.items()},
         "floor_ahead_pct": round(floor_ahead_pct, 2),
+        "wall_ahead_m": None if not np.isfinite(wall_m) else round(float(wall_m), 2),
         "objects": objects[:12],
         "costmap": {
             "res_m": 0.05,
