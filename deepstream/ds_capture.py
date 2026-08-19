@@ -171,7 +171,7 @@ class DSCaptureBackend:
         self._latest_frame: Optional[np.ndarray] = None
         self._frame_lock = threading.Lock()
         self._frame_skip = 0  # extract every Nth frame for preview
-        self._extract_preview = True  # set False to skip surface copies
+        self._paused = False
 
         self._fps = 0.0
         self._fps_n = 0
@@ -206,8 +206,31 @@ class DSCaptureBackend:
             self._thread.join(timeout=10.0)
             self._thread = None
 
+    def pause(self) -> None:
+        """Pause the pipeline to free GPU for other tasks (e.g. LLM)."""
+        if self._pipeline and not self._paused:
+            self._pipeline.set_state(Gst.State.PAUSED)
+            self._paused = True
+            logger.info("DeepStream pipeline PAUSED")
+
+    def resume(self) -> None:
+        """Resume the pipeline and wait for a fresh frame."""
+        if self._pipeline and self._paused:
+            self._pipeline.set_state(Gst.State.PLAYING)
+            self._paused = False
+            logger.info("DeepStream pipeline PLAYING (resumed)")
+            # Wait for the first fresh frame so the MJPEG preview updates
+            # immediately instead of staying frozen.
+            with self._frame_lock:
+                self._latest_frame = None
+            for _ in range(100):
+                if self._latest_frame is not None:
+                    break
+                time.sleep(0.05)
+
     def capture(self, timeout: float = 10.0) -> Optional[CaptureResult]:
-        self._extract_preview = True
+        if self._paused:
+            self.resume()
         with self._lock:
             self._capture_result = None
         self._capture_done.clear()
@@ -386,16 +409,12 @@ class DSCaptureBackend:
             self._fps_n = 0
             self._fps_t0 = now
 
-        # Extract the camera frame for the MJPEG preview, but only every
-        # 3rd probe call to avoid saturating the GPU with RGBA→BGR conversions.
-        # When _extract_preview is False (camera idle mode), extract at a
-        # reduced rate (~1fps) to keep the MJPEG stream alive without
-        # burning GPU on RGBA→BGR conversions.
+        # Extract the camera frame for the MJPEG preview every 3rd probe
+        # call to avoid saturating the GPU with RGBA→BGR conversions.
         do_capture = self._capture_requested.is_set()
         frame = None
         self._frame_skip += 1
-        skip_limit = 3 if self._extract_preview else 10
-        if do_capture or self._frame_skip >= skip_limit:
+        if do_capture or self._frame_skip >= 3:
             self._frame_skip = 0
             try:
                 n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)

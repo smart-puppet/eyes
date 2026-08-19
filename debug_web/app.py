@@ -424,6 +424,7 @@ class EyesStreamer:
         fps_n = 0
         last_capture_t = 0.0
         idle_timeout_s = 10.0
+        paused = False
         try:
             while self._running:
                 frame = backend.latest_frame
@@ -435,6 +436,9 @@ class EyesStreamer:
                 if do_capture:
                     self._capture_pending.clear()
                     last_capture_t = time.perf_counter()
+                    if paused:
+                        backend.resume()
+                        paused = False
 
                 with self._lock:
                     view = self._view
@@ -546,10 +550,12 @@ class EyesStreamer:
                     view = "camera"
                     last_capture_t = 0.0
 
-                # Idle display — skip GPU surface copies when not needed
+                # Idle display — pause pipeline when in camera view
                 if view == "camera":
                     hold_vis = None
-                    backend._extract_preview = False
+                    if not paused:
+                        backend.pause()
+                        paused = True
                 elif hold_vis is not None and not do_capture:
                     vis = hold_vis.copy()
                 else:
