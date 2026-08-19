@@ -1,6 +1,6 @@
 # eyes
 
-Perception module for Puppet: camera, YOLO, metric depth, floor segmentation → MQTT scene.
+Perception module for Puppet: camera, YOLO, metric depth → MQTT scene.
 
 Stack overview: [architecture](https://github.com/smart-puppet/docs/blob/main/architecture.md). Topics: [mqtt](https://github.com/smart-puppet/docs/blob/main/mqtt.md).
 

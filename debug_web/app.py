@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Eye: MJPEG camera, on-demand capture, drive pad, and live play speeds.
 
-Video is OpenCV capture; YOLO / DA-V2 / Fast-SCNN run on Capture (HTTP or
-robot/nav/capture). Drive arrows publish to robot/drive/*. Play speed sliders
-write brain/config/play.speeds and robot/play/speeds.
+Video is OpenCV capture; YOLO / DA-V2 run on Capture (HTTP or
+robot/nav/capture). Traversability floor comes from metric depth. Drive arrows
+publish to robot/drive/*. Play speed sliders write brain/config/play.speeds
+and robot/play/speeds.
 """
 
 from __future__ import annotations
@@ -36,16 +37,11 @@ from languages import list_language_profiles, parse_language_id
 sys.path.insert(0, str(ROOT))
 
 from camera import DEFAULT_PRODUCT_ID, DEFAULT_VENDOR_ID, find_video_device  # noqa: E402
-from nav.fast_scnn import (  # noqa: E402
-    logits_to_labels,
-    preprocess_fast_scnn,
-    remap_apartment,
-    resize_mask_to_frame,
-)
 from nav.mqtt_scene import ScenePublisher  # noqa: E402
 from nav.traversability import (  # noqa: E402
     FloorSmoother,
     build_scene,
+    depth_floor_mask,
     overlay_traversability,
 )
 from trt import (  # noqa: E402
@@ -59,13 +55,23 @@ from trt import (  # noqa: E402
     resize_depth_to_frame,
 )
 
+# Optional DeepStream backend (requires JetPack pyds + GStreamer)
+try:
+    _ds_root = str(ROOT / "deepstream")
+    if _ds_root not in sys.path:
+        sys.path.insert(0, _ds_root)
+    from ds_capture import DSCaptureBackend  # noqa: E402
+    _HAS_DEEPSTREAM = True
+except ImportError:
+    _HAS_DEEPSTREAM = False
+    DSCaptureBackend = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger("eyes")
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_YOLO = ROOT / "models" / "yolov8n_fp16.engine"
 DEFAULT_DEPTH = ROOT / "models" / "dav2_metric_indoor_small_518_int8.engine"
-DEFAULT_SCNN = ROOT / "models" / "fast_scnn_256x640_fp16.engine"
 HB_PERIOD_S = 0.15
 LOG_MAX_BRAIN = 5000
 LOG_MAX_DRIVE = 500
@@ -220,7 +226,7 @@ def _detections_to_objects(dets, frame_w: int) -> List[Dict[str, Any]]:
 
 
 class EyesStreamer:
-    """Background MJPEG + one-shot YOLO/DA-V2/Fast-SCNN on Capture."""
+    """Background MJPEG + one-shot YOLO/DA-V2 on Capture."""
 
     def __init__(
         self,
@@ -231,14 +237,13 @@ class EyesStreamer:
         fps: int,
         yolo_path: Path,
         depth_path: Path,
-        scnn_path: Path,
         conf: float,
         iou: float,
         jpeg_quality: int,
         overlay: bool,
         view: str = "camera",
         scene_pub: Optional[ScenePublisher] = None,
-        seg_every: int = 2,
+        use_deepstream: bool = False,
     ) -> None:
         self.device = device
         self.width = width
@@ -246,12 +251,11 @@ class EyesStreamer:
         self.fps = fps
         self.yolo_path = yolo_path
         self.depth_path = depth_path
-        self.scnn_path = scnn_path
         self.conf = conf
         self.iou = iou
         self.jpeg_quality = int(np.clip(jpeg_quality, 40, 95))
         self.scene_pub = scene_pub
-        self.seg_every = max(1, int(seg_every))
+        self.use_deepstream = use_deepstream and _HAS_DEEPSTREAM
 
         self._lock = threading.Lock()
         # view: camera | boxes | traverse — selects what Capture computes
@@ -281,7 +285,8 @@ class EyesStreamer:
         if self._thread and self._thread.is_alive():
             return
         self._running = True
-        self._thread = threading.Thread(target=self._loop, name="eyes-stream", daemon=True)
+        target = self._loop_ds if self.use_deepstream else self._loop
+        self._thread = threading.Thread(target=target, name="eyes-stream", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -365,10 +370,10 @@ class EyesStreamer:
                 "frame": self._frame_i,
                 "error": self._error,
                 "capturing": self._capturing or self._capture_pending.is_set(),
-                "manual": True,
+                "manual": not self.use_deepstream,
+                "backend": "deepstream" if self.use_deepstream else "trt",
                 "yolo": str(self.yolo_path.name),
                 "depth": str(self.depth_path.name),
-                "scnn": str(self.scnn_path.name),
                 "scene": self._last_scene,
                 **pub,
             }
@@ -387,6 +392,208 @@ class EyesStreamer:
             return b""
         return buf.tobytes()
 
+    def _loop_ds(self) -> None:
+        """Main loop: DeepStream owns the camera and does everything.
+
+        Live MJPEG frames come from pyds.get_nvds_buf_surface on the nvosd
+        sink pad (proven safe in ds_pipeline.py).  Inference results (YOLO
+        detections + depth tensor) are extracted only on capture.
+        """
+        backend = DSCaptureBackend(
+            device=self.device,
+            width=self.width,
+            height=self.height,
+            fps=self.fps,
+            conf=self.conf,
+        )
+        backend.start()
+        logger.info("DeepStream backend started, waiting for first frame …")
+
+        for _ in range(300):
+            if backend.latest_frame is not None:
+                break
+            time.sleep(0.1)
+        if backend.latest_frame is None:
+            with self._lock:
+                self._error = "DeepStream pipeline failed to produce frames"
+            backend.stop()
+            return
+        logger.info("DeepStream live preview active")
+
+        fps_t0 = time.perf_counter()
+        fps_n = 0
+        last_capture_t = 0.0
+        idle_timeout_s = 10.0
+        try:
+            while self._running:
+                frame = backend.latest_frame
+                if frame is None:
+                    time.sleep(0.01)
+                    continue
+
+                do_capture = self._capture_pending.is_set()
+                if do_capture:
+                    self._capture_pending.clear()
+                    last_capture_t = time.perf_counter()
+
+                with self._lock:
+                    view = self._view
+                    hold_vis = self._hold_vis
+
+                closest_m = float("nan")
+                num_dets = 0
+                infer_ms = 0.0
+                hint = ""
+                scene_payload: Dict[str, Any] = {}
+                capture_err: Optional[str] = None
+                vis = frame
+
+                if do_capture:
+                    if view == "camera":
+                        capture_err = "select Boxes or Traversability before capturing"
+                    else:
+                        t0 = time.perf_counter()
+                        result = backend.capture(timeout=10.0)
+                        if result is None:
+                            capture_err = "DeepStream capture timeout"
+                        else:
+                            cap_frame = result.frame
+                            dets = result.detections
+                            depth_map = result.depth_map
+
+                            attach_metric_distances(dets, depth_map)
+                            closest_m, closest_xy = closest_scene_metric(depth_map)
+                            num_dets = len(dets)
+
+                            if view == "traverse":
+                                floor_mask = self._floor.update(depth_floor_mask(depth_map))
+                                scene = build_scene(
+                                    depth_m=depth_map,
+                                    floor_mask=floor_mask,
+                                    detections=dets,
+                                    frame_hw=cap_frame.shape[:2],
+                                    closest_m=closest_m,
+                                )
+                                hint = scene.payload.get("hint", "")
+                                scene_payload = dict(scene.payload)
+                                scene_payload["objects"] = _detections_to_objects(
+                                    dets, cap_frame.shape[1]
+                                )
+                                with self._lock:
+                                    pending_id = self._pending_req_id
+                                if pending_id:
+                                    scene_payload["req_id"] = pending_id
+                                logger.info(
+                                    "scene publish objects=%s hint=%r",
+                                    len(scene_payload["objects"]),
+                                    hint,
+                                )
+                                vis = overlay_traversability(
+                                    cap_frame, scene.free_mask, scene.bev, hint
+                                )
+                                _draw_detections(vis, dets)
+                                if self.scene_pub is not None:
+                                    self.scene_pub.publish(scene_payload)
+                            else:
+                                vis = cap_frame.copy()
+                                _draw_detections(vis, dets)
+                                if closest_xy is not None and np.isfinite(closest_m):
+                                    cv2.circle(vis, closest_xy, 8, (40, 40, 255), 2, cv2.LINE_AA)
+                                    cv2.circle(vis, closest_xy, 3, (40, 40, 255), -1, cv2.LINE_AA)
+                                label = (
+                                    f"{num_dets} dets  closest={closest_m:.2f}m"
+                                    if np.isfinite(closest_m)
+                                    else f"{num_dets} dets"
+                                )
+                                cv2.putText(
+                                    vis, label, (10, 48),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                    (40, 220, 255), 2, cv2.LINE_AA,
+                                )
+                            infer_ms = (time.perf_counter() - t0) * 1000.0
+                            hold_vis = vis.copy()
+                            logger.info(
+                                "capture(DS) total=%.0fms view=%s dets=%s",
+                                infer_ms, view, num_dets,
+                            )
+
+                    with self._lock:
+                        self._capture_error = capture_err
+                        self._pending_req_id = None
+                        if hold_vis is not None and capture_err is None:
+                            self._hold_vis = hold_vis
+                        if scene_payload:
+                            self._last_scene = scene_payload
+                        if capture_err is None:
+                            self._infer_ms = float(infer_ms)
+                            self._num_dets = int(num_dets)
+                            self._closest_m = float(closest_m)
+                            self._hint = hint
+                    self._capture_done.set()
+
+                # Auto-revert to camera if no captures for a while
+                if (
+                    view != "camera"
+                    and last_capture_t > 0
+                    and not do_capture
+                    and time.perf_counter() - last_capture_t > idle_timeout_s
+                ):
+                    logger.info(
+                        "No capture for %.0fs, reverting to camera view",
+                        idle_timeout_s,
+                    )
+                    self.set_view("camera")
+                    view = "camera"
+                    last_capture_t = 0.0
+
+                # Idle display — skip GPU surface copies when not needed
+                if view == "camera":
+                    hold_vis = None
+                    backend._extract_preview = False
+                elif hold_vis is not None and not do_capture:
+                    vis = hold_vis.copy()
+                else:
+                    vis = frame if not do_capture or capture_err else vis
+
+                fps_n += 1
+                now = time.perf_counter()
+                with self._lock:
+                    fps = self._fps
+                    last_infer_ms = self._infer_ms
+                if now - fps_t0 >= 1.0:
+                    fps = fps_n / (now - fps_t0)
+                    fps_n = 0
+                    fps_t0 = now
+
+                show_ms = infer_ms if do_capture and capture_err is None else last_infer_ms
+                mode = "CAPTURE" if do_capture and capture_err is None else (
+                    "HOLD" if hold_vis is not None and view != "camera" else "LIVE"
+                )
+                cv2.putText(
+                    vis,
+                    f"{fps:.1f} FPS  {view}  {mode}  {show_ms:.0f}ms  DS",
+                    (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (40, 220, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+                jpeg = self._encode(vis)
+                with self._lock:
+                    if jpeg:
+                        self._jpeg = jpeg
+                    self._fps = float(fps)
+                    if view == "camera":
+                        self._hold_vis = None
+                    self._frame_i += 1
+
+                if not do_capture:
+                    time.sleep(0.015)
+        finally:
+            backend.stop()
+
     def _loop(self) -> None:
         cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
         if not cap.isOpened():
@@ -402,10 +609,8 @@ class EyesStreamer:
 
         yolo: Optional[TrtEngine] = None
         depth_engine: Optional[TrtEngine] = None
-        scnn: Optional[TrtEngine] = None
         yolo_w = 640
         depth_h = 518
-        scnn_h, scnn_w = 256, 640
         engines_loaded = False
 
         fps_t0 = time.perf_counter()
@@ -457,10 +662,6 @@ class EyesStreamer:
                                 depth_engine = TrtEngine(self.depth_path)
                                 yolo_w = int(yolo.input_shape[3])
                                 depth_h = int(depth_engine.input_shape[2])
-                                if view == "traverse" or self.scnn_path.is_file():
-                                    scnn = TrtEngine(self.scnn_path)
-                                    scnn_h = int(scnn.input_shape[2])
-                                    scnn_w = int(scnn.input_shape[3])
                                 engines_loaded = True
                                 with self._lock:
                                     self._error = None
@@ -469,13 +670,19 @@ class EyesStreamer:
                                 with self._lock:
                                     self._error = capture_err
                                 engines_loaded = False
-                                yolo = depth_engine = scnn = None
+                                yolo = depth_engine = None
 
                         if capture_err is None and yolo is not None and depth_engine is not None:
                             try:
                                 t0 = time.perf_counter()
                                 yolo_in, info = preprocess_yolo(frame, size=yolo_w)
-                                yolo_out = yolo.infer(yolo_in)
+                                depth_in = preprocess_dav2(frame, size=depth_h)
+                                t_pre = time.perf_counter()
+                                yolo.submit(yolo_in)
+                                depth_engine.submit(depth_in)
+                                yolo_out = yolo.wait()
+                                depth_out = depth_engine.wait()
+                                t_gpu = time.perf_counter()
                                 raw = next(iter(yolo_out.values()))
                                 if raw.ndim >= 2 and int(raw.shape[-1]) == 6:
                                     yolo_branch = "end2end"
@@ -502,8 +709,6 @@ class EyesStreamer:
                                         iou_thres=self.iou,
                                         max_det=30,
                                     )
-                                depth_in = preprocess_dav2(frame, size=depth_h)
-                                depth_out = depth_engine.infer(depth_in)
                                 depth_map = resize_depth_to_frame(
                                     next(iter(depth_out.values())), frame.shape[:2]
                                 )
@@ -528,18 +733,7 @@ class EyesStreamer:
                                     )
 
                                 if view == "traverse":
-                                    if scnn is None and self.scnn_path.is_file():
-                                        scnn = TrtEngine(self.scnn_path)
-                                        scnn_h = int(scnn.input_shape[2])
-                                        scnn_w = int(scnn.input_shape[3])
-                                    if scnn is None:
-                                        raise RuntimeError("Fast-SCNN engine not loaded")
-                                    scnn_in = preprocess_fast_scnn(frame, scnn_h, scnn_w)
-                                    scnn_out = next(iter(scnn.infer(scnn_in).values()))
-                                    labels = logits_to_labels(scnn_out)
-                                    floor, _wall, _other = remap_apartment(labels)
-                                    floor_mask = resize_mask_to_frame(floor, frame.shape[:2])
-                                    floor_mask = self._floor.update(floor_mask)
+                                    floor_mask = self._floor.update(depth_floor_mask(depth_map))
                                     scene = build_scene(
                                         depth_m=depth_map,
                                         floor_mask=floor_mask,
@@ -595,6 +789,15 @@ class EyesStreamer:
                                         cv2.LINE_AA,
                                     )
                                 infer_ms = (time.perf_counter() - t0) * 1000.0
+                                logger.info(
+                                    "capture pre=%.0fms gpu=%.0fms cpu=%.0fms total=%.0fms view=%s dets=%s",
+                                    (t_pre - t0) * 1000.0,
+                                    (t_gpu - t_pre) * 1000.0,
+                                    (time.perf_counter() - t_gpu) * 1000.0,
+                                    infer_ms,
+                                    view,
+                                    num_dets,
+                                )
                                 hold_vis = vis.copy()
                             except Exception as exc:  # noqa: BLE001
                                 capture_err = f"capture failed: {exc}"
@@ -620,10 +823,10 @@ class EyesStreamer:
                 # Idle display: freeze last capture when in boxes/traverse; else live
                 if view == "camera":
                     if engines_loaded:
-                        for eng in (yolo, depth_engine, scnn):
+                        for eng in (yolo, depth_engine):
                             if eng is not None:
                                 eng.close()
-                        yolo = depth_engine = scnn = None
+                        yolo = depth_engine = None
                         engines_loaded = False
                     vis = frame
                     hold_vis = None
@@ -670,7 +873,7 @@ class EyesStreamer:
                     self._frame_i += 1
         finally:
             cap.release()
-            for eng in (yolo, depth_engine, scnn):
+            for eng in (yolo, depth_engine):
                 if eng is not None:
                     eng.close()
 
@@ -980,6 +1183,11 @@ def _startup() -> None:
         if streamer is None:
             logger.warning("capture request ignored: streamer not ready")
             return
+        # Support explicit stop: {"stop": true} → revert to camera view
+        if payload.get("stop"):
+            logger.info("MQTT capture stop → switching to camera view")
+            streamer.set_view("camera")
+            return
         view = str(payload.get("view") or "traverse")
         if view not in ("boxes", "traverse"):
             view = "traverse"
@@ -1019,14 +1227,13 @@ def _startup() -> None:
         fps=int(_cfg.get("fps", 30)),
         yolo_path=Path(_cfg.get("yolo", DEFAULT_YOLO)),
         depth_path=Path(_cfg.get("depth", DEFAULT_DEPTH)),
-        scnn_path=Path(_cfg.get("scnn", DEFAULT_SCNN)),
         conf=float(_cfg.get("conf", 0.50)),
         iou=float(_cfg.get("iou", 0.45)),
         jpeg_quality=int(_cfg.get("jpeg_quality", 80)),
         overlay=bool(_cfg.get("overlay", False)),
         view=str(_cfg.get("view", "camera")),
         scene_pub=scene_publisher,
-        seg_every=int(_cfg.get("seg_every", 2)),
+        use_deepstream=bool(_cfg.get("deepstream", False)),
     )
     streamer.start()
 
@@ -1297,7 +1504,6 @@ def main() -> None:
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--yolo", type=Path, default=DEFAULT_YOLO)
     p.add_argument("--depth", type=Path, default=DEFAULT_DEPTH)
-    p.add_argument("--scnn", type=Path, default=DEFAULT_SCNN)
     p.add_argument("--conf", type=float, default=0.50)
     p.add_argument("--iou", type=float, default=0.45)
     p.add_argument("--jpeg-quality", type=int, default=80)
@@ -1310,9 +1516,13 @@ def main() -> None:
         "--view",
         choices=("camera", "boxes", "traverse"),
         default="camera",
-        help="Initial view mode (traverse = Fast-SCNN floor + costmap)",
+        help="Initial view mode (traverse = depth floor + costmap)",
     )
-    p.add_argument("--seg-every", type=int, default=2, help="Run Fast-SCNN every N frames")
+    p.add_argument(
+        "--deepstream",
+        action="store_true",
+        help="Use DeepStream GPU pipeline instead of manual TRT (faster capture)",
+    )
     p.add_argument("--scene-topic", default="robot/nav/scene")
     p.add_argument("--capture-topic", default="robot/nav/capture")
     p.add_argument("--broker", default=os.environ.get("MQTT_BROKER", "127.0.0.1"))
@@ -1342,7 +1552,7 @@ def main() -> None:
     logging.getLogger("uvicorn.error").setLevel(logging.INFO)
     logging.getLogger("uvicorn.access").setLevel(logging.INFO)
 
-    for path in (args.yolo, args.depth, args.scnn):
+    for path in (args.yolo, args.depth):
         if not path.is_file():
             raise SystemExit(f"missing engine: {path}")
 
@@ -1364,13 +1574,11 @@ def main() -> None:
             "fps": args.fps,
             "yolo": args.yolo,
             "depth": args.depth,
-            "scnn": args.scnn,
             "conf": args.conf,
             "iou": args.iou,
             "jpeg_quality": args.jpeg_quality,
             "overlay": args.overlay,
             "view": view,
-            "seg_every": args.seg_every,
             "scene_topic": args.scene_topic,
             "capture_topic": args.capture_topic,
             "broker": args.broker,
@@ -1379,6 +1587,7 @@ def main() -> None:
             "username": args.username,
             "password": args.password,
             "brain_config": args.brain_config,
+            "deepstream": args.deepstream,
         }
     )
 
@@ -1392,11 +1601,14 @@ def main() -> None:
 
     import uvicorn
 
-    logger.info("Camera %s", device)
-    logger.info("YOLO   %s", args.yolo)
-    logger.info("Depth  %s", args.depth)
-    logger.info("SCNN   %s", args.scnn)
-    logger.info("View   %s", view)
+    if args.deepstream and not _HAS_DEEPSTREAM:
+        logger.warning("--deepstream requested but pyds/gi not available; falling back to manual TRT")
+    backend_name = "DeepStream" if (args.deepstream and _HAS_DEEPSTREAM) else "Manual TRT"
+    logger.info("Camera  %s", device)
+    logger.info("Backend %s", backend_name)
+    logger.info("YOLO    %s", args.yolo)
+    logger.info("Depth   %s", args.depth)
+    logger.info("View    %s", view)
     logger.info("MQTT   %s:%s  drive=%s", args.broker, args.broker_port, args.prefix)
     logger.info("Scene  %s  capture=%s", args.scene_topic, args.capture_topic)
     logger.info("Lang   %s (language.active + play.speeds)", args.brain_config)

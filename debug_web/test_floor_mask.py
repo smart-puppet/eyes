@@ -48,13 +48,11 @@ def test_depth_floor_mask_labels_ground_plane() -> None:
   assert not mask[2, 32]
 
 
-def test_build_scene_treats_wood_floor_as_free_without_scnn() -> None:
+def test_build_scene_treats_wood_floor_as_free() -> None:
   h, w = 48, 64
   depth = _ground_plane(h, w)
-  empty_scnn = np.zeros((h, w), dtype=bool)
   scene = build_scene(
     depth_m=depth,
-    floor_mask=empty_scnn,
     detections=[],
     frame_hw=(h, w),
     closest_m=0.96,
@@ -68,10 +66,8 @@ def test_build_scene_treats_wood_floor_as_free_without_scnn() -> None:
 def test_build_scene_reports_wall_not_floor() -> None:
   h, w = 48, 64
   depth = np.full((h, w), 0.45, dtype=np.float32)
-  empty_scnn = np.zeros((h, w), dtype=bool)
   scene = build_scene(
     depth_m=depth,
-    floor_mask=empty_scnn,
     detections=[],
     frame_hw=(h, w),
   )
@@ -84,12 +80,8 @@ def test_build_scene_reports_wall_not_floor() -> None:
 def test_build_scene_kallax_face_is_not_free() -> None:
   h, w = 48, 64
   depth = np.full((h, w), 0.62, dtype=np.float32)
-  # Fast-SCNN often paints a horizontal band of "floor" on furniture.
-  painted = np.zeros((h, w), dtype=bool)
-  painted[int(h * 0.4) : int(h * 0.7), :] = True
   scene = build_scene(
     depth_m=depth,
-    floor_mask=painted,
     detections=[],
     frame_hw=(h, w),
     closest_m=0.58,

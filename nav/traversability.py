@@ -127,9 +127,8 @@ def depth_floor_mask(
 ) -> np.ndarray:
     """Mark pixels whose pinhole height matches the floor.
 
-    Fast-SCNN is Cityscapes (road / sidewalk / terrain). Indoor wood and tile
-    often miss that palette, so metric depth is the apartment ground prior —
-    no extra TensorRT net. Close vertical furniture must stay blocked.
+    Indoor wood and tile are a metric-depth ground prior — no extra TensorRT
+    net. Close vertical furniture must stay blocked.
     """
     z = np.asarray(depth, dtype=np.float32)
     if z.ndim != 2 or z.size == 0:
@@ -187,7 +186,7 @@ def _sector_ranges(
 
 
 def clean_floor_mask(floor: np.ndarray) -> np.ndarray:
-    """Fill Fast-SCNN speckles/holes on the ground. CPU-only, no extra TRT."""
+    """Fill speckles/holes on the ground. CPU-only, no extra TRT."""
     mask = np.asarray(floor, dtype=np.uint8)
     if mask.ndim != 2 or mask.size == 0:
         return np.asarray(floor, dtype=bool)
@@ -332,19 +331,18 @@ def _encode_bev_rle(bev: np.ndarray) -> Dict[str, Any]:
 def build_scene(
     *,
     depth_m: np.ndarray,
-    floor_mask: np.ndarray,
     detections: Sequence[Detection],
     frame_hw: Tuple[int, int],
     d_min: float = 0.25,
     d_max: float = 4.0,
     closest_m: float = float("nan"),
+    floor_mask: Optional[np.ndarray] = None,
 ) -> SceneSummary:
     # Full-frame nearest depth is usually the floor under a low camera; ignore it.
     _ = closest_m
     h, w = frame_hw
-    scnn = clean_floor_mask(floor_mask)
-    geo = depth_floor_mask(depth_m)
-    floor = clean_floor_mask(scnn | geo) & ~vertical_face_mask(depth_m)
+    geo = np.asarray(floor_mask, dtype=bool) if floor_mask is not None else depth_floor_mask(depth_m)
+    floor = clean_floor_mask(geo) & ~vertical_face_mask(depth_m)
     free = floor & np.isfinite(depth_m) & (depth_m >= d_min) & (depth_m <= d_max)
     free = _apply_yolo_nogo(free, detections, (h, w))
 

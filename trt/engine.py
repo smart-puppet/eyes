@@ -22,7 +22,7 @@ def _dtype_of(trt_dtype: trt.DataType):
         trt.int8: np.int8,
         trt.bool: np.bool_,
     }
-    # Fast-SCNN (and some argmax heads) emit INT64 class indices.
+    # Some argmax heads emit INT64 class indices.
     if hasattr(trt, "int64"):
         mapping[trt.int64] = np.int64
     if hasattr(trt, "bfloat16"):
@@ -93,6 +93,11 @@ class TrtEngine:
         By default returns views into reusable host buffers (lowest latency).
         Pass ``copy_outputs=True`` if you need to keep tensors across frames.
         """
+        self.submit(inp)
+        return self.wait(copy_outputs=copy_outputs)
+
+    def submit(self, inp: np.ndarray) -> None:
+        """Enqueue H2D + execute + D2H on this engine's stream (no sync)."""
         binding = self.bindings[self.input_name]
         host = binding["host"]
         if inp.shape != host.shape:
@@ -105,13 +110,13 @@ class TrtEngine:
         ok = self.context.execute_async_v3(self.stream.handle)
         if not ok:
             raise RuntimeError("TensorRT execute_async_v3 failed")
-
-        outputs: Dict[str, np.ndarray] = {}
         for name in self.output_names:
             out = self.bindings[name]
             cudart.memcpy_dtoh_async(out["host"], out["device"], out["nbytes"], self.stream)
-            outputs[name] = out["host"]
+
+    def wait(self, *, copy_outputs: bool = False) -> Dict[str, np.ndarray]:
         self.stream.synchronize()
+        outputs = {name: self.bindings[name]["host"] for name in self.output_names}
         if copy_outputs:
             return {k: v.copy() for k, v in outputs.items()}
         return outputs

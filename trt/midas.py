@@ -28,7 +28,7 @@ def resize_depth_to_frame(depth: np.ndarray, frame_shape: Tuple[int, int]) -> np
     h, w = frame_shape
     if depth.ndim == 3:
         depth = depth[0]
-    return cv2.resize(depth.astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC)
+    return cv2.resize(depth.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
 
 
 def depth_to_colormap(depth: np.ndarray) -> np.ndarray:

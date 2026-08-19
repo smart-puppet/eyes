@@ -1,11 +1,5 @@
-"""Navigation helpers for eyes (segmentation + traversability)."""
+"""Navigation helpers for eyes (depth floor + traversability)."""
 
-from .fast_scnn import (
-    logits_to_labels,
-    preprocess_fast_scnn,
-    remap_apartment,
-    resize_mask_to_frame,
-)
 from .traversability import (
     FloorSmoother,
     SceneSummary,
@@ -18,10 +12,6 @@ from .traversability import (
 )
 
 __all__ = [
-    "preprocess_fast_scnn",
-    "logits_to_labels",
-    "remap_apartment",
-    "resize_mask_to_frame",
     "FloorSmoother",
     "SceneSummary",
     "build_scene",
