@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[1]
 from mic_volume import get_default_mic, set_default_mic
+from speaker_volume import get_default_speaker, set_default_speaker
 from play_speeds import read_play_speeds, write_play_speeds
 from languages import list_language_profiles, parse_language_id
 sys.path.insert(0, str(ROOT))
@@ -1154,6 +1155,10 @@ class MicRequest(BaseModel):
     percent: int = Field(..., ge=0, le=150)
 
 
+class SpeakerRequest(BaseModel):
+    percent: int = Field(..., ge=0, le=150)
+
+
 class SpeedsRequest(BaseModel):
     follow_turn: int = Field(..., ge=20, le=200)
     seek_turn: int = Field(..., ge=20, le=200)
@@ -1318,6 +1323,30 @@ def api_set_mic(body: MicRequest) -> Dict[str, Any]:
         "Default mic volume %s%% source=%s",
         result.get("percent"),
         result.get("source"),
+    )
+    return result
+
+
+@app.get("/api/speaker")
+def api_speaker() -> Dict[str, Any]:
+    try:
+        return get_default_speaker()
+    except RuntimeError as exc:
+        raise HTTPException(503, f"could not read default speaker: {exc}") from exc
+
+
+@app.post("/api/speaker")
+def api_set_speaker(body: SpeakerRequest) -> Dict[str, Any]:
+    try:
+        result = set_default_speaker(body.percent)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, f"could not set default speaker: {exc}") from exc
+    logger.info(
+        "Default speaker volume %s%% sink=%s",
+        result.get("percent"),
+        result.get("sink"),
     )
     return result
 
@@ -1497,7 +1526,7 @@ def stream_mjpg() -> StreamingResponse:
 class _QuietAccessFilter(logging.Filter):
     """Drop high-frequency poll/stream access lines from uvicorn."""
 
-    _SKIP = ("/api/state", "/api/logs", "/api/mic", "/api/speeds", "/stream.mjpg")
+    _SKIP = ("/api/state", "/api/logs", "/api/mic", "/api/speaker", "/api/speeds", "/stream.mjpg")
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()

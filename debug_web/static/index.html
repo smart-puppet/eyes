@@ -377,6 +377,12 @@
           <span class="val" id="micVal">50%</span>
         </div>
         <span class="lang-note" id="micNote">Default Pulse microphone — live</span>
+        <div class="row">
+          <label for="speaker">Speaker</label>
+          <input id="speaker" type="range" min="0" max="150" value="50" />
+          <span class="val" id="speakerVal">50%</span>
+        </div>
+        <span class="lang-note" id="speakerNote">Default Pulse speaker — live</span>
       </div>
     </div>
 
@@ -412,6 +418,9 @@
     const micEl = document.getElementById("mic");
     const micVal = document.getElementById("micVal");
     const micNote = document.getElementById("micNote");
+    const speakerEl = document.getElementById("speaker");
+    const speakerVal = document.getElementById("speakerVal");
+    const speakerNote = document.getElementById("speakerNote");
 
     speedEl.addEventListener("input", () => { speedVal.textContent = speedEl.value; });
     ttlEl.addEventListener("input", () => { ttlVal.textContent = ttlEl.value; });
@@ -616,6 +625,57 @@
       setMic(micEl.value);
     });
     loadMic();
+
+    function showSpeaker(data) {
+      if (typeof data.percent === "number") {
+        speakerEl.value = String(data.percent);
+        speakerVal.textContent = data.percent + "%";
+      }
+      const label = data.label || "default speaker";
+      if (data.muted) {
+        speakerNote.textContent = label + " muted";
+      } else if (data.ok) {
+        speakerNote.textContent = label + " — live";
+      } else {
+        speakerNote.textContent = data.note || "Speaker volume unavailable";
+      }
+    }
+
+    async function loadSpeaker() {
+      try {
+        const res = await fetch("/api/speaker");
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const detail = data.detail || res.statusText;
+          throw new Error(res.status === 404 ? "refresh the page after restarting eyes" : detail);
+        }
+        showSpeaker(data);
+      } catch (e) {
+        speakerNote.textContent = "Speaker: " + e.message;
+      }
+    }
+
+    let speakerTimer = null;
+    async function setSpeaker(percent) {
+      speakerVal.textContent = percent + "%";
+      try {
+        const data = await post("/api/speaker", { percent: Number(percent) });
+        showSpeaker(data);
+      } catch (e) {
+        speakerNote.textContent = "Speaker error: " + e.message;
+      }
+    }
+    speakerEl.addEventListener("input", () => {
+      speakerVal.textContent = speakerEl.value + "%";
+      clearTimeout(speakerTimer);
+      speakerTimer = setTimeout(() => setSpeaker(speakerEl.value), 80);
+    });
+    speakerEl.addEventListener("change", () => {
+      clearTimeout(speakerTimer);
+      setSpeaker(speakerEl.value);
+    });
+    loadSpeaker();
+
     async function hold(dir) {
       if (activeDir === dir) return;
       activeDir = dir;
