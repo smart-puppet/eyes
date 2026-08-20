@@ -146,6 +146,46 @@
       padding: 0.7rem;
       touch-action: none;
     }
+    .pad[hidden] { display: none; }
+    .occ-map {
+      max-width: 280px;
+      width: 100%;
+      margin: 0 auto;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 1rem;
+      padding: 0.55rem;
+    }
+    .occ-map[hidden] { display: none; }
+    .occ-map canvas {
+      display: block;
+      width: 100%;
+      aspect-ratio: 1;
+      border-radius: 0.6rem;
+      background: #1c241e;
+      image-rendering: pixelated;
+    }
+    .occ-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 0.5rem;
+      margin-top: 0.4rem;
+      font-size: 0.68rem;
+      color: var(--muted);
+    }
+    .occ-legend span { margin-right: 0.55rem; }
+    .occ-legend i {
+      display: inline-block;
+      width: 0.55rem;
+      height: 0.55rem;
+      border-radius: 0.15rem;
+      margin-right: 0.2rem;
+      vertical-align: -0.05rem;
+    }
+    .sw-unk { background: #2a332c; }
+    .sw-free { background: #3cb450; }
+    .sw-occ { background: #3c3cdc; }
+    .sw-bot { background: #ffe56a; }
     .btn {
       border: 1px solid var(--border);
       border-radius: 0.75rem;
@@ -340,6 +380,18 @@
           <button class="btn right" data-dir="right" aria-label="Right">▶</button>
           <button class="btn down" data-dir="backward" aria-label="Backward">▼</button>
         </div>
+        <div class="occ-map" id="occMap" hidden>
+          <canvas id="occCanvas" width="280" height="280" aria-label="Seek occupancy map"></canvas>
+          <div class="occ-meta">
+            <span class="occ-legend">
+              <i class="sw-unk"></i>unknown
+              <i class="sw-free"></i>free
+              <i class="sw-occ"></i>wall
+              <i class="sw-bot"></i>puppet
+            </span>
+            <span id="occStats">map</span>
+          </div>
+        </div>
 
         <button class="stop" id="stopBtn" type="button">Stop</button>
         <div class="row">
@@ -421,6 +473,10 @@
     const speakerEl = document.getElementById("speaker");
     const speakerVal = document.getElementById("speakerVal");
     const speakerNote = document.getElementById("speakerNote");
+    const padEl = document.getElementById("pad");
+    const occMap = document.getElementById("occMap");
+    const occCanvas = document.getElementById("occCanvas");
+    const occStats = document.getElementById("occStats");
 
     speedEl.addEventListener("input", () => { speedVal.textContent = speedEl.value; });
     ttlEl.addEventListener("input", () => { ttlVal.textContent = ttlEl.value; });
@@ -676,7 +732,88 @@
     });
     loadSpeaker();
 
+    function decodeGridRle(n, runs) {
+      const need = n * n;
+      const cells = new Uint8Array(need);
+      let i = 0;
+      (runs || []).forEach((run) => {
+        const value = Number(run[0]) || 0;
+        const count = Math.max(0, Number(run[1]) || 0);
+        if (i >= need) return;
+        cells.fill(value, i, Math.min(need, i + count));
+        i += count;
+      });
+      return cells;
+    }
+
+    function drawExplore(explore) {
+      const ctx = occCanvas.getContext("2d");
+      const w = occCanvas.width;
+      const h = occCanvas.height;
+      ctx.fillStyle = "#1c241e";
+      ctx.fillRect(0, 0, w, h);
+      if (!explore || !explore.n || !explore.grid) {
+        ctx.fillStyle = "#8aa090";
+        ctx.font = "13px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("waiting for map…", w / 2, h / 2);
+        occStats.textContent = "map";
+        return;
+      }
+      const n = Number(explore.n);
+      const cells = decodeGridRle(n, explore.grid);
+      const img = ctx.createImageData(n, n);
+      const pal = [
+        [42, 51, 44, 255],
+        [60, 180, 80, 255],
+        [60, 60, 220, 255],
+      ];
+      for (let i = 0; i < cells.length; i++) {
+        const c = pal[cells[i]] || pal[0];
+        img.data[i * 4] = c[0];
+        img.data[i * 4 + 1] = c[1];
+        img.data[i * 4 + 2] = c[2];
+        img.data[i * 4 + 3] = c[3];
+      }
+      const off = document.createElement("canvas");
+      off.width = n;
+      off.height = n;
+      off.getContext("2d").putImageData(img, 0, 0);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(off, 0, 0, w, h);
+
+      const res = Number(explore.res_m) || 0.1;
+      const origin = n / 2;
+      const px = ((origin + Number(explore.x || 0) / res) / n) * w;
+      const py = ((origin - Number(explore.y || 0) / res) / n) * h;
+      const yaw = (Number(explore.yaw) || 0) * Math.PI / 180;
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate(-yaw);
+      ctx.fillStyle = "#ffe56a";
+      ctx.beginPath();
+      ctx.moveTo(12, 0);
+      ctx.lineTo(-8, 8);
+      ctx.lineTo(-8, -8);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+      occStats.textContent = (explore.frontiers || 0) + " frontiers";
+    }
+
+    function setSeekView(on) {
+      padEl.hidden = !!on;
+      occMap.hidden = !on;
+      if (on && activeDir) {
+        release();
+      }
+      if (!on) {
+        occStats.textContent = "map";
+      }
+    }
+
     async function hold(dir) {
+      if (currentPlay === "seek") return;
       if (activeDir === dir) return;
       activeDir = dir;
       document.querySelectorAll(".btn[data-dir]").forEach((b) => {
@@ -752,7 +889,8 @@
         ev.preventDefault();
         hold(dir);
       }
-    });    window.addEventListener("keyup", (ev) => {
+    });
+    window.addEventListener("keyup", (ev) => {
       const dir = keyMap[ev.key];
       if (dir && activeDir === dir) {
         ev.preventDefault();
@@ -765,6 +903,8 @@
       const play = (data.drive && data.drive.play) || {};
       const playMode = data.play_mode || play.mode || "idle";
       syncPlayButtons(playMode);
+      setSeekView(playMode === "seek");
+      drawExplore(play.explore);
       modeBadge.textContent = playMode + (data.play_busy ? " busy" : "");
 
       const drive = data.drive || {};
@@ -794,6 +934,11 @@
         "dets: " + (data.dets ?? "—") + "  closest: " + (data.closest_m ?? "—") + " m",
         "hint: " + (data.hint || "—"),
         "sectors L/C/R: " + (sec.left ?? "—") + " / " + (sec.center ?? "—") + " / " + (sec.right ?? "—"),
+        play.explore
+          ? ("map: " + (play.explore.known ?? 0) + " cells  frontiers: " + (play.explore.frontiers ?? 0)
+            + "  pose: " + (play.explore.x ?? "—") + "," + (play.explore.y ?? "—")
+            + "  yaw: " + (play.explore.yaw ?? "—"))
+          : "map: —",
         "scene mqtt: " + (data.mqtt_ok ? "ok " + (data.topic || "") : "down"),
         "device: " + (data.device ?? "—"),
         "",
