@@ -127,8 +127,8 @@
       cursor: pointer;
       touch-action: manipulation;
     }
-    .toggle button.active {
-      background: var(--btn-active);
+    .toggle button#btnCancelPlay.active {
+      background: var(--stop);
       color: #fff;
     }
     .pad {
@@ -310,20 +310,19 @@
 </head>
 <body>
   <h1>Eye</h1>
-  <p class="sub">Camera · Capture · hold arrows to drive (WASD) · live follow/seek/forward speeds · STOP flushes MCU · language is saved for the next brain start · mic slider is the Pulse default input (live) · brain/drive logs below</p>
+  <p class="sub">Camera · follow / hide-and-seek · hold arrows to drive (WASD) · live speeds · STOP flushes MCU · language is saved for the next brain start · mic slider is the Pulse default input (live) · brain/drive logs below</p>
 
   <div class="layout">
     <div class="row">
-      <span id="modeBadge" class="badge">camera</span>
+      <span id="modeBadge" class="badge">idle</span>
       <span id="holdBadge" class="badge">idle</span>
       <span id="estopBadge" class="badge estop" hidden>estop</span>
       <span id="errBadge" class="badge err" hidden>error</span>
-      <div class="toggle" role="group" aria-label="View mode">
-        <button type="button" id="btnCamera" class="active">Camera</button>
-        <button type="button" id="btnOverlay">Boxes + distance</button>
-        <button type="button" id="btnTraverse">Traversability</button>
+      <div class="toggle" role="group" aria-label="Play">
+        <button type="button" id="btnFollow">Follow me</button>
+        <button type="button" id="btnSeek">Hide and seek</button>
+        <button type="button" id="btnCancelPlay">Cancel</button>
       </div>
-      <button type="button" class="capture-btn" id="captureBtn">Capture</button>
       <div class="toggle lang" id="langToggle" role="group" aria-label="Brain language"></div>
       <span class="lang-note" id="langNote">Language applies when brain starts</span>
     </div>
@@ -394,10 +393,9 @@
     const estopBadge = document.getElementById("estopBadge");
     const errBadge = document.getElementById("errBadge");
     const statusEl = document.getElementById("status");
-    const btnCamera = document.getElementById("btnCamera");
-    const btnOverlay = document.getElementById("btnOverlay");
-    const btnTraverse = document.getElementById("btnTraverse");
-    const captureBtn = document.getElementById("captureBtn");
+    const btnFollow = document.getElementById("btnFollow");
+    const btnSeek = document.getElementById("btnSeek");
+    const btnCancelPlay = document.getElementById("btnCancelPlay");
     const langToggle = document.getElementById("langToggle");
     const langNote = document.getElementById("langNote");
     const speedEl = document.getElementById("speed");
@@ -419,8 +417,7 @@
     ttlEl.addEventListener("input", () => { ttlVal.textContent = ttlEl.value; });
 
     let activeDir = null;
-    let capturing = false;
-    let currentView = "camera";
+    let currentPlay = "idle";
     const keyMap = {
       ArrowUp: "forward", w: "forward", W: "forward",
       ArrowDown: "backward", s: "backward", S: "backward",
@@ -440,52 +437,26 @@
       return res.json();
     }
 
-    function syncCaptureBtn() {
-      captureBtn.disabled = capturing || currentView === "camera";
-      captureBtn.textContent = capturing ? "Capturing…" : "Capture";
+    function syncPlayButtons(mode) {
+      currentPlay = mode || "idle";
+      btnFollow.classList.toggle("active", currentPlay === "follow");
+      btnSeek.classList.toggle("active", currentPlay === "seek");
+      btnCancelPlay.classList.remove("active");
+      modeBadge.textContent = currentPlay;
     }
 
-    async function setView(view) {
-      currentView = view;
-      btnCamera.classList.toggle("active", view === "camera");
-      btnOverlay.classList.toggle("active", view === "boxes");
-      btnTraverse.classList.toggle("active", view === "traverse");
-      modeBadge.textContent = view;
-      syncCaptureBtn();
+    async function setPlay(mode) {
+      syncPlayButtons(mode === "idle" || mode === "stop" || mode === "cancel" ? "idle" : mode);
       try {
-        await post("/api/view", { view });
+        const data = await post("/api/play", { mode });
+        syncPlayButtons(data.mode || mode);
       } catch (e) {
-        statusEl.textContent = "View error: " + e.message;
+        statusEl.textContent = "Play error: " + e.message;
       }
     }
-    btnCamera.addEventListener("click", () => setView("camera"));
-    btnOverlay.addEventListener("click", () => setView("boxes"));
-    btnTraverse.addEventListener("click", () => setView("traverse"));
-
-    async function triggerCapture() {
-      if (capturing || currentView === "camera") return;
-      capturing = true;
-      syncCaptureBtn();
-      try {
-        const data = await post("/api/capture");
-        statusEl.textContent = [
-          "capture ok  view: " + (data.view || currentView),
-          "infer: " + (data.infer_ms ?? "—") + " ms  dets: " + (data.dets ?? "—"),
-          "closest: " + (data.closest_m ?? "—") + " m  hint: " + (data.hint || "—"),
-        ].join("\n");
-        await poll();
-      } catch (e) {
-        statusEl.textContent = "Capture error: " + e.message;
-      } finally {
-        capturing = false;
-        syncCaptureBtn();
-      }
-    }
-    captureBtn.addEventListener("click", (e) => {
-      e.preventDefault();
-      triggerCapture();
-    });
-    syncCaptureBtn();
+    btnFollow.addEventListener("click", () => setPlay("follow"));
+    btnSeek.addEventListener("click", () => setPlay("seek"));
+    btnCancelPlay.addEventListener("click", () => setPlay("idle"));
 
     function renderLanguageButtons(profiles, active) {
       langToggle.replaceChildren();
@@ -716,13 +687,6 @@
         stopAll();
         return;
       }
-      if (ev.key === "c" || ev.key === "C") {
-        if (!ev.metaKey && !ev.ctrlKey && !ev.altKey) {
-          ev.preventDefault();
-          triggerCapture();
-        }
-        return;
-      }
       const dir = keyMap[ev.key];
       if (dir) {
         ev.preventDefault();
@@ -738,13 +702,10 @@
     window.addEventListener("blur", () => { release(); });
 
     function renderState(data) {
-      const view = data.view || (data.overlay ? "boxes" : "camera");
-      currentView = view;
-      btnCamera.classList.toggle("active", view === "camera");
-      btnOverlay.classList.toggle("active", view === "boxes");
-      btnTraverse.classList.toggle("active", view === "traverse");
-      modeBadge.textContent = view;
-      syncCaptureBtn();
+      const play = (data.drive && data.drive.play) || {};
+      const playMode = data.play_mode || play.mode || "idle";
+      syncPlayButtons(playMode);
+      modeBadge.textContent = playMode + (data.play_busy ? " busy" : "");
 
       const drive = data.drive || {};
       const st = drive.status || {};
@@ -767,7 +728,8 @@
 
       const sec = (data.scene && data.scene.sectors) || {};
       const lines = [
-        "view: " + view + "  mode: manual capture",
+        "play: " + playMode + (data.play_busy ? " (talking — camera paused)" : ""),
+        "camera: " + (data.backend || "opencv"),
         "fps: " + (data.fps ?? "—") + "  infer: " + (data.infer_ms ?? "—") + " ms",
         "dets: " + (data.dets ?? "—") + "  closest: " + (data.closest_m ?? "—") + " m",
         "hint: " + (data.hint || "—"),
@@ -780,9 +742,7 @@
         "mode: " + (st.mode ?? "—") + "  estop: " + (estop ? "YES" : "no"),
         "error: " + (errs.join("; ") || "—"),
       ];
-      if (!capturing) {
-        statusEl.textContent = lines.join("\n");
-      }
+      statusEl.textContent = lines.join("\n");
     }
 
     async function poll() {

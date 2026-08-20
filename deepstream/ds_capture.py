@@ -274,15 +274,6 @@ class DSCaptureBackend:
             )
             decode = self._make_element("jpegdec", "jpeg-decoder")
 
-        # Drop frames to reduce GPU load (videorate caps at ~10fps).
-        # This leaves headroom for the LLM on the same Jetson GPU.
-        vrate = self._make_element("videorate", "framerate-limiter")
-        vrate.set_property("drop-only", True)
-        caps_rate = self._make_element("capsfilter", "caps-rate")
-        caps_rate.set_property(
-            "caps", Gst.Caps.from_string("video/x-raw, framerate=10/1"),
-        )
-
         conv = self._make_element("nvvidconv", "nvvidconv-premux")
         caps_nvmm = self._make_element("capsfilter", "caps-nvmm")
         caps_nvmm.set_property(
@@ -295,7 +286,7 @@ class DSCaptureBackend:
         streammux.set_property("height", self.height)
         streammux.set_property("batch-size", 1)
         streammux.set_property("live-source", 1)
-        streammux.set_property("batched-push-timeout", 100000)  # ~10fps budget
+        streammux.set_property("batched-push-timeout", 33000)
         streammux.set_property("nvbuf-memory-type", 0)
 
         queue1 = self._make_element("queue", "queue-yolo")
@@ -329,7 +320,7 @@ class DSCaptureBackend:
         sink.set_property("async", False)
 
         for el in (
-            source, caps_src, decode, vrate, caps_rate,
+            source, caps_src, decode,
             conv, caps_nvmm, streammux,
             queue1, pgie, queue2, depth_infer,
             nvvidconv, nvosd, sink,
@@ -338,9 +329,7 @@ class DSCaptureBackend:
 
         source.link(caps_src)
         caps_src.link(decode)
-        decode.link(vrate)
-        vrate.link(caps_rate)
-        caps_rate.link(conv)
+        decode.link(conv)
         conv.link(caps_nvmm)
 
         sinkpad = streammux.request_pad_simple("sink_0")

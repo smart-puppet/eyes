@@ -29,7 +29,7 @@ from trt import (
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_YOLO = ROOT / "models" / "yolov8n_fp16.engine"
+DEFAULT_YOLO = ROOT / "models" / "yolo26n_fp16.engine"
 DEFAULT_MIDAS = ROOT / "models" / "midas_small_fp16.engine"
 
 
