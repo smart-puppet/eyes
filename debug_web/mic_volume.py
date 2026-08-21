@@ -12,6 +12,31 @@ _VOLUME_PCT_RE = re.compile(r"/\s*(\d+)%")
 _MUTE_RE = re.compile(r"Mute:\s*(yes|no)", re.IGNORECASE)
 MIC_MIN_PERCENT = 0
 MIC_MAX_PERCENT = 150
+_RESPEAKER_MARKERS = ("respeaker", "xvf3800", "seeed")
+
+
+def pulse_name_is_respeaker(name: str) -> bool:
+  lowered = (name or "").lower()
+  if ".monitor" in lowered:
+    return False
+  return any(marker in lowered for marker in _RESPEAKER_MARKERS)
+
+
+def pick_respeaker_pulse_name(short_list: str) -> str | None:
+  analog = None
+  other = None
+  for line in (short_list or "").splitlines():
+    parts = line.split("\t")
+    if len(parts) < 2:
+      continue
+    name = parts[1].strip()
+    if not pulse_name_is_respeaker(name):
+      continue
+    if "analog" in name.lower():
+      analog = name
+    elif other is None:
+      other = name
+  return analog or other
 
 
 def parse_source_volume_percent(text: str) -> Optional[int]:
@@ -72,14 +97,24 @@ def _run_pactl(*args: str) -> str:
   return result.stdout
 
 
+def _respeaker_or_default_source() -> str:
+  chosen = pick_respeaker_pulse_name(_run_pactl("list", "sources", "short"))
+  if chosen:
+    return chosen
+  return _run_pactl("get-default-source").strip()
+
+
 def get_default_mic() -> dict[str, Any]:
-  source = _run_pactl("get-default-source").strip()
-  volume_out = _run_pactl("get-source-volume", "@DEFAULT_SOURCE@")
-  mute_out = _run_pactl("get-source-mute", "@DEFAULT_SOURCE@")
+  source = _respeaker_or_default_source()
+  volume_out = _run_pactl("get-source-volume", source)
+  mute_out = _run_pactl("get-source-mute", source)
   percent = parse_source_volume_percent(volume_out)
   if percent is None:
     raise RuntimeError(f"could not parse mic volume: {volume_out.strip()[:120]}")
   percent = max(MIC_MIN_PERCENT, min(MIC_MAX_PERCENT, percent))
+  note = "reSpeaker XVF3800 input — live"
+  if not pulse_name_is_respeaker(source):
+    note = "Pulse default input (not reSpeaker) — live"
   return {
     "ok": True,
     "percent": percent,
@@ -87,7 +122,7 @@ def get_default_mic() -> dict[str, Any]:
     "source": source,
     "label": source_label(source),
     "applies": "live",
-    "note": "PulseAudio default input — applies immediately",
+    "note": note,
   }
 
 
@@ -95,7 +130,8 @@ def set_default_mic(percent: int) -> dict[str, Any]:
   value = int(percent)
   if value < MIC_MIN_PERCENT or value > MIC_MAX_PERCENT:
     raise ValueError(f"percent must be {MIC_MIN_PERCENT}-{MIC_MAX_PERCENT}")
-  _run_pactl("set-source-volume", "@DEFAULT_SOURCE@", f"{value}%")
+  source = _respeaker_or_default_source()
+  _run_pactl("set-source-volume", source, f"{value}%")
   if value > 0:
-    _run_pactl("set-source-mute", "@DEFAULT_SOURCE@", "0")
+    _run_pactl("set-source-mute", source, "0")
   return get_default_mic()
