@@ -44,6 +44,7 @@ from nav.traversability import (  # noqa: E402
     build_scene,
     depth_floor_mask,
     overlay_traversability,
+    warmup_traversability,
 )
 from trt import (  # noqa: E402
     TrtEngine,
@@ -53,7 +54,6 @@ from trt import (  # noqa: E402
     postprocess_yolo_end2end,
     preprocess_dav2,
     preprocess_yolo,
-    resize_depth_to_frame,
 )
 
 # Optional DeepStream backend (requires JetPack pyds + GStreamer)
@@ -72,7 +72,8 @@ logger = logging.getLogger("eyes")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_YOLO = ROOT / "models" / "yolo26n_fp16.engine"
-DEFAULT_DEPTH = ROOT / "models" / "dav2_metric_indoor_small_518_int8.engine"
+DEFAULT_DEPTH = ROOT / "models" / "dav2_metric_indoor_base_518_int8.engine"
+DEFAULT_DEPTH_CONFIG = ROOT / "deepstream" / "config_infer_dav2_metric_base.txt"
 HB_PERIOD_S = 0.15
 LOG_MAX_BRAIN = 5000
 LOG_MAX_DRIVE = 500
@@ -498,6 +499,7 @@ class EyesStreamer:
             height=self.height,
             fps=self.fps,
             conf=self.conf,
+            depth_config=str(_cfg.get("depth_config", DEFAULT_DEPTH_CONFIG)),
         )
         backend.start()
         logger.info("DeepStream pipeline starting, waiting for first frame …")
@@ -511,12 +513,20 @@ class EyesStreamer:
             backend.stop()
             return None
         logger.info("DeepStream pipeline PLAYING")
+        warmup_traversability()
         with self._lock:
             self._error = None
         return backend
 
     def _scene_from_capture(self, cap_frame, dets, depth_map, view: str):
+        fh, fw = cap_frame.shape[:2]
+        dh, dw = depth_map.shape[:2]
         closest_m, closest_xy = closest_scene_metric(depth_map)
+        if closest_xy is not None and (dh, dw) != (fh, fw):
+            closest_xy = (
+                int(closest_xy[0] * fw / max(dw, 1)),
+                int(closest_xy[1] * fh / max(dh, 1)),
+            )
         num_dets = len(dets)
         hint = ""
         scene_payload: Dict[str, Any] = {}
@@ -527,7 +537,7 @@ class EyesStreamer:
                 depth_m=depth_map,
                 floor_mask=floor_mask,
                 detections=dets,
-                frame_hw=cap_frame.shape[:2],
+                frame_hw=(fh, fw),
                 closest_m=closest_m,
             )
             hint = scene.payload.get("hint", "")
@@ -538,7 +548,13 @@ class EyesStreamer:
             if pending_id:
                 scene_payload["req_id"] = pending_id
             logger.info("scene publish objects=%s hint=%r", len(scene_payload["objects"]), hint)
-            vis = overlay_traversability(cap_frame, scene.free_mask, scene.bev, hint)
+            overlay = True
+            with self._lock:
+                overlay = self._play_mode not in ("follow", "seek")
+            if overlay:
+                vis = overlay_traversability(cap_frame, scene.free_mask, scene.bev, hint)
+            else:
+                vis = cap_frame.copy()
             _draw_detections(vis, dets)
             if self.scene_pub is not None:
                 self.scene_pub.publish(scene_payload)
@@ -563,10 +579,12 @@ class EyesStreamer:
     def _tick_ds(self, backend, fps_n: int, fps_t0: float) -> tuple:
         do_capture = self._capture_pending.is_set()
         busy = self._play_busy_now()
+        resumed = False
         if do_capture:
             self._capture_pending.clear()
             if getattr(backend, "_paused", False):
                 backend.resume()
+                resumed = True
         elif busy:
             backend.pause()
         else:
@@ -592,16 +610,31 @@ class EyesStreamer:
         if do_capture:
             t0 = time.perf_counter()
             result = backend.capture(timeout=10.0)
+            wait_ms = (time.perf_counter() - t0) * 1000.0
             if result is None:
                 capture_err = "DeepStream capture timeout"
             else:
-                attach_metric_distances(result.detections, result.depth_map)
+                attach_metric_distances(
+                    result.detections, result.depth_map, box_hw=result.frame.shape[:2]
+                )
+                t1 = time.perf_counter()
                 vis, scene_payload, closest_m, num_dets, hint = self._scene_from_capture(
                     result.frame, result.detections, result.depth_map, "traverse"
                 )
+                scene_ms = (time.perf_counter() - t1) * 1000.0
                 infer_ms = (time.perf_counter() - t0) * 1000.0
                 hold_vis = vis.copy()
-                logger.info("capture(DS) total=%.0fms dets=%s", infer_ms, num_dets)
+                logger.info(
+                    "capture(DS) total=%.0fms wait=%.0fms scene=%.0fms dets=%s "
+                    "depth=%sx%s resumed=%s",
+                    infer_ms,
+                    wait_ms,
+                    scene_ms,
+                    num_dets,
+                    result.depth_map.shape[1],
+                    result.depth_map.shape[0],
+                    resumed,
+                )
             self._commit_capture(
                 capture_err=capture_err,
                 hold_vis=hold_vis,
@@ -723,16 +756,24 @@ class EyesStreamer:
                                 iou_thres=self.iou,
                                 max_det=30,
                             )
-                        depth_map = resize_depth_to_frame(
-                            next(iter(depth_out.values())), frame.shape[:2]
-                        )
-                        attach_metric_distances(dets, depth_map)
+                        depth_out = next(iter(depth_out.values()))
+                        if depth_out.ndim == 3:
+                            depth_out = depth_out[0]
+                        depth_map = np.asarray(depth_out, dtype=np.float32)
+                        attach_metric_distances(dets, depth_map, box_hw=frame.shape[:2])
                         vis, scene_payload, closest_m, num_dets, hint = self._scene_from_capture(
                             frame, dets, depth_map, view
                         )
                         infer_ms = (time.perf_counter() - t0) * 1000.0
                         hold_vis = vis.copy()
-                        logger.info("capture(OpenCV) total=%.0fms view=%s dets=%s", infer_ms, view, num_dets)
+                        logger.info(
+                            "capture(OpenCV) total=%.0fms view=%s dets=%s depth=%sx%s",
+                            infer_ms,
+                            view,
+                            num_dets,
+                            depth_map.shape[1],
+                            depth_map.shape[0],
+                        )
                     except Exception as exc:  # noqa: BLE001
                         capture_err = f"capture failed: {exc}"
                         with self._lock:
@@ -1545,6 +1586,12 @@ def main() -> None:
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--yolo", type=Path, default=DEFAULT_YOLO)
     p.add_argument("--depth", type=Path, default=DEFAULT_DEPTH)
+    p.add_argument(
+        "--depth-config",
+        type=Path,
+        default=DEFAULT_DEPTH_CONFIG,
+        help="DeepStream nvinfer config (default: DA-V2 Metric Indoor Base INT8)",
+    )
     p.add_argument("--conf", type=float, default=0.50)
     p.add_argument("--iou", type=float, default=0.45)
     p.add_argument("--jpeg-quality", type=int, default=80)
@@ -1596,6 +1643,8 @@ def main() -> None:
     for path in (args.yolo, args.depth):
         if not path.is_file():
             raise SystemExit(f"missing engine: {path}")
+    if not args.depth_config.is_file():
+        raise SystemExit(f"missing depth config: {args.depth_config}")
 
     device = args.device
     if device is None:
@@ -1615,6 +1664,7 @@ def main() -> None:
             "fps": args.fps,
             "yolo": args.yolo,
             "depth": args.depth,
+            "depth_config": args.depth_config,
             "conf": args.conf,
             "iou": args.iou,
             "jpeg_quality": args.jpeg_quality,

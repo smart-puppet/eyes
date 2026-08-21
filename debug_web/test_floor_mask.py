@@ -10,6 +10,7 @@ from nav.traversability import (  # noqa: E402
     build_scene,
     clean_floor_mask,
     depth_floor_mask,
+    using_cupy,
 )
 
 
@@ -90,3 +91,36 @@ def test_build_scene_kallax_face_is_not_free() -> None:
   assert scene.payload["wall_ahead_m"] < 0.75
   assert scene.payload["floor_ahead_pct"] < 0.2
   assert scene.free_mask[int(h * 0.55), w // 2] == False
+
+
+def test_using_cupy_reports_bool() -> None:
+  assert isinstance(using_cupy(), bool)
+
+
+def test_build_scene_keeps_native_depth_size() -> None:
+  from trt.yolo import Detection
+
+  dh, dw = 40, 50
+  fh, fw = 80, 160
+  depth = np.full((dh, dw), 2.4, dtype=np.float32)
+  depth[int(dh * 0.6) :, :] = 2.8
+  person = Detection(x1=10, y1=20, x2=40, y2=70, conf=0.9, cls_id=0)
+  scene = build_scene(
+    depth_m=depth,
+    detections=[person],
+    frame_hw=(fh, fw),
+  )
+  assert scene.free_mask.shape == (dh, dw)
+  assert scene.bev.ndim == 2
+
+
+def test_overlay_upscales_native_mask() -> None:
+  from nav.traversability import overlay_traversability
+
+  frame = np.zeros((240, 320, 3), dtype=np.uint8)
+  mask = np.zeros((40, 50), dtype=bool)
+  mask[30:, :] = True
+  bev = np.zeros((10, 12), dtype=np.uint8)
+  vis = overlay_traversability(frame, mask, bev, "ok")
+  assert vis.shape == frame.shape
+  assert vis[200, 80].sum() > 0

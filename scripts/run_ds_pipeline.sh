@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the DeepStream nvinfer YOLO + depth pipeline
-# (default: DA-V2 Metric Indoor Small INT8).
+# (default: DA-V2 Metric Indoor Base INT8).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT/deepstream"

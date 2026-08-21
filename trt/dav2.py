@@ -38,9 +38,27 @@ def sample_metric_depth(depth: np.ndarray, det: Detection, center_frac: float = 
 def attach_metric_distances(
     detections: list[Detection],
     depth_map: np.ndarray,
+    box_hw: Tuple[int, int] | None = None,
 ) -> list[Detection]:
+    """Fill ``distance_m`` from the depth map.
+
+    ``box_hw`` is the frame the boxes were drawn in. Depth often stays at
+    the DA-V2 native size (518×518); boxes are scaled into that grid.
+    """
+    dh, dw = depth_map.shape[:2]
+    bh, bw = box_hw if box_hw is not None else (dh, dw)
+    sx = dw / max(float(bw), 1.0)
+    sy = dh / max(float(bh), 1.0)
     for det in detections:
-        metres = sample_metric_depth(depth_map, det)
+        mapped = Detection(
+            x1=det.x1 * sx,
+            y1=det.y1 * sy,
+            x2=det.x2 * sx,
+            y2=det.y2 * sy,
+            conf=det.conf,
+            cls_id=det.cls_id,
+        )
+        metres = sample_metric_depth(depth_map, mapped)
         det.distance_m = metres if np.isfinite(metres) else None
     return detections
 

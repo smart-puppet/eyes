@@ -156,7 +156,7 @@ class DSCaptureBackend:
 
         ds_dir = Path(__file__).resolve().parent
         self.yolo_config = yolo_config or str(ds_dir / "config_infer_yolo26.txt")
-        self.depth_config = depth_config or str(ds_dir / "config_infer_dav2_metric.txt")
+        self.depth_config = depth_config or str(ds_dir / "config_infer_dav2_metric_base.txt")
 
         self._lock = threading.Lock()
         self._pipeline: Optional[Gst.Pipeline] = None
@@ -430,10 +430,10 @@ class DSCaptureBackend:
             self._capture_requested.set()
             return Gst.PadProbeReturn.OK
 
-        if depth.shape[0] != self.height or depth.shape[1] != self.width:
-            depth = cv2.resize(
-                depth, (self.width, self.height), interpolation=cv2.INTER_LINEAR
-            )
+        if depth.ndim == 3:
+            depth = depth[0]
+        # Keep DA-V2 native resolution (518×518). Floor/BEV run here; the
+        # overlay nearest-neighbor upscales the mask onto the camera frame.
 
         dets = _detections_from_frame_meta(
             frame_meta, self.width, self.height, self.conf
@@ -496,8 +496,11 @@ class DSCaptureBackend:
         bus.connect("message", self._bus_call, self._loop)
 
         logger.info(
-            "DeepStream pipeline starting: %s @ %dx%d",
-            self.device, self.width, self.height,
+            "DeepStream pipeline starting: %s @ %dx%d depth=%s",
+            self.device,
+            self.width,
+            self.height,
+            Path(self.depth_config).name,
         )
         ret = self._pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:

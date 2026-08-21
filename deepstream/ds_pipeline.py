@@ -2,7 +2,7 @@
 """DeepStream nvinfer pipeline: USB cam → YOLO26n + depth → boxes + metres.
 
 Default detector: YOLO26n FP16 (end2end). YOLOv8n via --yolo-config config_infer_yolo.txt.
-Default depth: DA-V2 Metric Indoor Small INT8 (metres, nearer=smaller).
+Default depth: DA-V2 Metric Indoor Base INT8 (metres, nearer=smaller).
 Fallback: MiDaS-small relative via --relative-depth --depth-config config_infer_midas.txt
 
 Graph:
@@ -32,7 +32,7 @@ from bus_call import bus_call  # noqa: E402
 ROOT = Path(__file__).resolve().parent
 YOLO_CFG = str(ROOT / "config_infer_yolo26.txt")
 YOLO_V8_CFG = str(ROOT / "config_infer_yolo.txt")  # fallback
-DEPTH_CFG = str(ROOT / "config_infer_dav2_metric.txt")
+DEPTH_CFG = str(ROOT / "config_infer_dav2_metric_base.txt")
 MIDAS_CFG = str(ROOT / "config_infer_midas.txt")
 YOLO_UID = 1
 DEPTH_UID = 2
@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--depth-config",
         default=DEPTH_CFG,
-        help="nvinfer config for depth (default: DA-V2 Metric Indoor Small INT8)",
+        help="nvinfer config for depth (default: DA-V2 Metric Indoor Base INT8)",
     )
     p.add_argument(
         "--midas-config",
